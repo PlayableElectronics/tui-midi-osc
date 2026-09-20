@@ -1,0 +1,18 @@
+[package]
+name = "index"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.28"
+midir = "0.10"
+rosc = "0.10"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+ratatui = "0.29"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+

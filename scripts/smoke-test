@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$ROOT"
+if ! command -v sclang >/dev/null 2>&1 && [ -z "${INDEX_SCLANG:-}" ]; then
+  echo "sclang is required for the smoke test. Run: cargo run -- doctor" >&2
+  exit 2
+fi
+cargo run --quiet -- run examples/first-light --headless
+echo "smoke test passed: handshake, pattern update, SC MIDI event, monitor delivery, shutdown"
