@@ -29,5 +29,6 @@ velocities = [
     95,
     85,
 ]
+gate = 0.8
 channel = 1
 destination = "Monitor"

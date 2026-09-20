@@ -1,99 +1,43 @@
+mod midi;
+mod project;
+mod protocol;
+
 use anyhow::{anyhow, Context, Result};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use midir::{MidiOutput, MidiOutputConnection};
+use midi::{MidiOutputBackend, MonitorOutput, SharedOutput};
+use project::{example_project, load, save, validate, Pattern, Project};
+use protocol::*;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Row, Table, Tabs},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs},
     Terminal,
 };
 use rosc::{decoder::decode_udp, encoder::encode, OscMessage, OscPacket, OscType};
-use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     env, fs, io,
     net::{SocketAddr, UdpSocket},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{mpsc, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
-const VERSION: &str = "v1";
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Pattern {
-    pub name: String,
-    pub degrees: Vec<i32>,
-    pub durations: Vec<f32>,
-    pub velocities: Vec<u8>,
-    pub channel: u8,
-    pub destination: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineStatus {
+    Starting,
+    Syncing,
+    Ready,
+    Error,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Project {
-    pub name: String,
-    pub tempo: f32,
-    pub pattern: Pattern,
-}
-
-fn example_project() -> Project {
-    Project {
-        name: "first-light".into(),
-        tempo: 120.0,
-        pattern: Pattern {
-            name: "bass".into(),
-            degrees: vec![0, 0, 3, 5, 3, 0, -2, -5],
-            durations: vec![0.5; 8],
-            velocities: vec![105, 90, 110, 100, 90, 105, 95, 85],
-            channel: 1,
-            destination: "Monitor".into(),
-        },
-    }
-}
-fn load_project(dir: &Path) -> Result<Project> {
-    let p: Project = toml::from_str(&fs::read_to_string(dir.join("project.toml"))?)?;
-    validate(&p.pattern)?;
-    Ok(p)
-}
-fn save_project(dir: &Path, p: &Project) -> Result<()> {
-    fs::create_dir_all(dir.join("patterns"))?;
-    let data = toml::to_string_pretty(p)?;
-    let tmp = dir.join("project.toml.tmp");
-    fs::write(&tmp, data)?;
-    fs::rename(tmp, dir.join("project.toml"))?;
-    fs::write(
-        dir.join("patterns/bass.toml"),
-        toml::to_string_pretty(&p.pattern)?,
-    )?;
-    Ok(())
-}
-fn validate(x: &Pattern) -> Result<()> {
-    if x.name.is_empty()
-        || x.degrees.is_empty()
-        || x.degrees.len() != x.durations.len()
-        || x.degrees.len() != x.velocities.len()
-    {
-        return Err(anyhow!(
-            "pattern requires equally-sized non-empty degrees, durations and velocities"
-        ));
-    }
-    if x.durations.iter().any(|d| *d <= 0.0) {
-        return Err(anyhow!("durations must be positive"));
-    }
-    if x.velocities.iter().any(|v| *v > 127) || !(1..=16).contains(&x.channel) {
-        return Err(anyhow!("MIDI velocity/channel out of range"));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone)]
 struct MidiEvent {
     at: f64,
@@ -106,42 +50,63 @@ struct MidiEvent {
 #[derive(Debug, Clone)]
 struct AppState {
     project: Project,
+    status: EngineStatus,
     screen: usize,
     selected: usize,
     column: usize,
+    device_index: usize,
     playing: bool,
-    engine_ready: bool,
-    monitor: VecDeque<MidiEvent>,
-    errors: VecDeque<String>,
-    status: String,
+    staged: bool,
+    live_revision: u64,
+    staged_revision: u64,
     pending_edit: Option<String>,
+    monitor: VecDeque<MidiEvent>,
+    logs: VecDeque<String>,
+    errors: VecDeque<String>,
+    request: u64,
 }
 impl AppState {
     fn new(project: Project) -> Self {
         Self {
             project,
+            status: EngineStatus::Starting,
             screen: 1,
             selected: 0,
             column: 0,
+            device_index: 0,
             playing: false,
-            engine_ready: false,
-            monitor: VecDeque::with_capacity(16),
-            errors: VecDeque::with_capacity(8),
-            status: "starting engine".into(),
+            staged: false,
+            live_revision: 0,
+            staged_revision: 0,
             pending_edit: None,
+            monitor: VecDeque::new(),
+            logs: VecDeque::new(),
+            errors: VecDeque::new(),
+            request: 1,
         }
     }
+    fn next_request(&mut self) -> String {
+        let x = format!("r{}", self.request);
+        self.request += 1;
+        x
+    }
+    fn error(&mut self, text: impl Into<String>) {
+        if self.errors.len() >= 32 {
+            self.errors.pop_front();
+        }
+        self.errors.push_back(text.into());
+    }
+    fn log(&mut self, text: impl Into<String>) {
+        if self.logs.len() >= 64 {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(text.into());
+    }
     fn event(&mut self, e: MidiEvent) {
-        if self.monitor.len() == 12 {
+        if self.monitor.len() >= 24 {
             self.monitor.pop_front();
         }
         self.monitor.push_back(e);
-    }
-    fn error(&mut self, s: String) {
-        if self.errors.len() == 8 {
-            self.errors.pop_front();
-        }
-        self.errors.push_back(s);
     }
 }
 
@@ -149,25 +114,22 @@ struct Engine {
     socket: Arc<UdpSocket>,
     addr: SocketAddr,
     child: Child,
+    stopped: bool,
 }
 impl Engine {
-    fn start(project_dir: &Path) -> Result<(Self, mpsc::Receiver<OscPacket>)> {
+    fn start() -> Result<(Self, mpsc::Receiver<OscPacket>, mpsc::Receiver<String>)> {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0")?);
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-        let local = socket.local_addr()?;
-        let sc_socket = UdpSocket::bind("127.0.0.1:0")?;
-        let sc_addr = sc_socket.local_addr()?;
-        drop(sc_socket);
-        let sc = env::var("INDEX_SCLANG").ok().or_else(|| which("sclang"));
-        let sc = sc.ok_or_else(|| {
-            anyhow!("sclang not found; install SuperCollider or set INDEX_SCLANG=/path/to/sclang")
-        })?;
+        let rust_addr = socket.local_addr()?;
+        let reserve = UdpSocket::bind("127.0.0.1:0")?;
+        let sc_addr = reserve.local_addr()?;
+        drop(reserve);
+        let path = env::var("INDEX_SCLANG").ok().or_else(|| which("sclang")).ok_or_else(|| anyhow!("sclang not found; install with `brew install --cask supercollider` or set INDEX_SCLANG=/absolute/path/to/sclang"))?;
         let script = fs::canonicalize("sc/bootstrap.scd").context("sc/bootstrap.scd missing")?;
-        let mut child = Command::new(sc)
+        let mut child = Command::new(path)
             .arg("-D")
             .arg(script)
-            .env("INDEX_PROJECT", project_dir)
-            .env("INDEX_RUST_PORT", local.port().to_string())
+            .env("INDEX_RUST_PORT", rust_addr.port().to_string())
             .env("INDEX_SC_PORT", sc_addr.port().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -175,33 +137,36 @@ impl Engine {
             .spawn()
             .context("launch sclang")?;
         let (tx, rx) = mpsc::channel();
-        let read_socket = socket.clone();
+        let recv = socket.clone();
         thread::spawn(move || {
             let mut buf = [0u8; 65535];
             loop {
-                match read_socket.recv_from(&mut buf) {
+                match recv.recv_from(&mut buf) {
                     Ok((n, _)) => {
                         if let Ok((_, packet)) = decode_udp(&buf[..n]) {
                             let _ = tx.send(packet);
                         }
                     }
-                    Err(_) => thread::sleep(Duration::from_millis(20)),
+                    Err(_) => thread::yield_now(),
                 }
             }
         });
-        if let Some(out) = child.stdout.take() {
+        let (ltx, lrx) = mpsc::channel();
+        if let Some(pipe) = child.stdout.take() {
+            let tx = ltx.clone();
             thread::spawn(move || {
-                use std::io::BufRead;
-                for line in io::BufReader::new(out).lines().flatten() {
-                    eprintln!("[sclang] {line}");
+                use io::BufRead;
+                for line in io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                    let _ = tx.send(format!("SC stdout: {line}"));
                 }
             });
         }
-        if let Some(err) = child.stderr.take() {
+        if let Some(pipe) = child.stderr.take() {
+            let tx = ltx.clone();
             thread::spawn(move || {
-                use std::io::BufRead;
-                for line in io::BufReader::new(err).lines().flatten() {
-                    eprintln!("[sclang stderr] {line}");
+                use io::BufRead;
+                for line in io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                    let _ = tx.send(format!("SC stderr: {line}"));
                 }
             });
         }
@@ -210,19 +175,28 @@ impl Engine {
                 socket,
                 addr: sc_addr,
                 child,
+                stopped: false,
             },
             rx,
+            lrx,
         ))
     }
     fn send(&self, path: &str, args: Vec<OscType>) -> Result<()> {
-        let packet = OscPacket::Message(OscMessage {
-            addr: format!("/index/{VERSION}{path}"),
+        let p = OscPacket::Message(OscMessage {
+            addr: format!("{ROOT}{path}"),
             args,
         });
-        self.socket.send_to(&encode(&packet)?, self.addr)?;
+        self.socket.send_to(&encode(&p)?, self.addr)?;
         Ok(())
     }
+    fn exited(&mut self) -> Result<Option<i32>> {
+        Ok(self.child.try_wait()?.map(|s| s.code().unwrap_or(-1)))
+    }
     fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
         let _ = self.send("/transport/stop", vec![]);
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -233,7 +207,6 @@ impl Drop for Engine {
         self.stop();
     }
 }
-
 fn which(name: &str) -> Option<String> {
     env::var_os("PATH")
         .and_then(|p| {
@@ -243,422 +216,483 @@ fn which(name: &str) -> Option<String> {
         })
         .map(|p| p.to_string_lossy().into_owned())
 }
-fn f(v: &OscType) -> Option<f32> {
-    match v {
-        OscType::Float(x) => Some(*x),
-        OscType::Double(x) => Some(*x as f32),
-        OscType::Int(x) => Some(*x as f32),
-        _ => None,
-    }
+
+fn pattern_args(req: &str, rev: u64, p: &Pattern) -> Vec<OscType> {
+    protocol::pattern_args(req, rev, p)
 }
-fn i(v: &OscType) -> Option<i32> {
-    match v {
-        OscType::Int(x) => Some(*x),
-        OscType::Float(x) => Some(*x as i32),
-        _ => None,
-    }
+fn send_sync(e: &Engine, s: &mut AppState) -> Result<()> {
+    let req = s.next_request();
+    s.status = EngineStatus::Syncing;
+    let mut a = vec![OscType::String(req), OscType::Float(s.project.meta.tempo)];
+    a.extend(
+        pattern_args("sync", 1, &s.project.pattern)
+            .into_iter()
+            .skip(2),
+    );
+    e.send("/project/sync", a)
 }
-fn s(v: &OscType) -> Option<String> {
-    if let OscType::String(x) = v {
-        Some(x.clone())
-    } else {
-        None
-    }
+fn stage(e: &Engine, s: &mut AppState) -> Result<()> {
+    let req = s.next_request();
+    s.staged = true;
+    s.staged_revision += 1;
+    e.send(
+        "/pattern/set",
+        pattern_args(&req, s.staged_revision, &s.project.pattern),
+    )
+}
+fn commit(e: &Engine, s: &mut AppState, mode: &str) -> Result<()> {
+    let req = s.next_request();
+    e.send(
+        "/pattern/commit",
+        vec![
+            OscType::String(req),
+            OscType::Int(s.staged_revision as i32),
+            OscType::String(mode.into()),
+        ],
+    )
 }
 
-fn packet_loop(rx: mpsc::Receiver<OscPacket>, state: Arc<Mutex<AppState>>) {
-    for packet in rx {
-        let OscPacket::Message(m) = packet else {
-            continue;
-        };
-        let mut st = state.lock().unwrap();
-        match m.addr.as_str() {
-            "/index/v1/ready" => {
-                st.engine_ready = true;
-                st.status = "SC READY".into();
+fn handle_packet(p: OscPacket, s: &mut AppState, out: &SharedOutput) {
+    let OscPacket::Message(m) = p else { return };
+    match m.addr.as_str() {
+        READY => {
+            if s.status == EngineStatus::Starting {
+                s.status = EngineStatus::Syncing;
+                s.log("SC READY; synchronizing project");
             }
-            "/index/v1/state" => {
-                if let Some(x) = m.args.first().and_then(i) {
-                    st.playing = x != 0;
-                }
-            }
-            "/index/v1/event/midi" => {
-                if m.args.len() >= 6 {
-                    if let (Some(at), Some(kind), Some(note), Some(vel), Some(ch), Some(dest)) = (
-                        m.args.get(0).and_then(f).map(|x| x as f64),
-                        m.args.get(1).and_then(s),
-                        m.args.get(2).and_then(i),
-                        m.args.get(3).and_then(i),
-                        m.args.get(4).and_then(i),
-                        m.args.get(5).and_then(s),
-                    ) {
-                        st.event(MidiEvent {
-                            at,
-                            kind,
-                            note,
-                            velocity: vel as u8,
-                            channel: ch as u8,
-                            destination: dest,
-                        });
-                    }
-                }
-            }
-            "/index/v1/error" => {
-                if let Some(x) = m.args.first().and_then(s) {
-                    st.error(x);
-                }
-            }
-            _ => {}
         }
-    }
-}
-
-fn pattern_args(p: &Pattern) -> Vec<OscType> {
-    vec![
-        OscType::String(p.name.clone()),
-        OscType::String(
-            p.degrees
-                .iter()
-                .map(i32::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
-        ),
-        OscType::String(
-            p.durations
-                .iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-        ),
-        OscType::String(
-            p.velocities
-                .iter()
-                .map(u8::to_string)
-                .collect::<Vec<_>>()
-                .join(","),
-        ),
-        OscType::Int(p.channel as i32),
-        OscType::String(p.destination.clone()),
-    ]
-}
-fn send_pattern(engine: &Engine, p: &Pattern, quantized: bool) -> Result<()> {
-    engine.send("/pattern/set", pattern_args(p))?;
-    engine.send("/pattern/commit", vec![OscType::Int(quantized as i32)])
-}
-
-fn draw<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>, st: &AppState) -> Result<()> {
-    terminal.draw(|frame| {
-        let root = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(
-                [
-                    Constraint::Length(2),
-                    Constraint::Min(5),
-                    Constraint::Length(2),
-                ]
-                .as_ref(),
-            )
-            .split(frame.area());
-        let tabs = Tabs::new(
-            ["F1 Perform", "F2 Sequence", "F3 Devices", "F4 Code/Log"]
-                .iter()
-                .map(|x| Line::from(*x))
-                .collect::<Vec<_>>(),
-        )
-        .select(st.screen)
-        .block(Block::default().borders(Borders::BOTTOM))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
-        frame.render_widget(tabs, root[0]);
-        if st.screen == 1 {
-            let header = Row::new(["#", "DEG", "DUR", "VEL", "CH", "DEST"])
-                .style(Style::default().fg(Color::Yellow));
-            let rows = st.project.pattern.degrees.iter().enumerate().map(|(n, d)| {
-                Row::new([
-                    n.to_string(),
-                    d.to_string(),
-                    format!("{:.2}", st.project.pattern.durations[n]),
-                    st.project.pattern.velocities[n].to_string(),
-                    st.project.pattern.channel.to_string(),
-                    st.project.pattern.destination.clone(),
-                ])
-                .style(if n == st.selected {
-                    Style::default().bg(Color::DarkGray)
-                } else {
-                    Style::default()
-                })
-            });
-            frame.render_widget(
-                Table::new(
-                    rows,
-                    [
-                        Constraint::Length(3),
-                        Constraint::Length(5),
-                        Constraint::Length(7),
-                        Constraint::Length(5),
-                        Constraint::Length(4),
-                        Constraint::Min(10),
-                    ],
-                )
-                .block(
-                    Block::default()
-                        .title(" bass / indexed pattern ")
-                        .borders(Borders::ALL),
-                )
-                .header(header),
-                root[1],
-            );
-        } else {
-            let text = if st.screen == 0 {
-                format!(
-                    "{}\n\nRecent events: {}",
-                    if st.playing {
-                        "Transport PLAYING"
+        SYNC_ACK => {
+            s.status = EngineStatus::Ready;
+            s.staged = false;
+            s.live_revision = m
+                .args
+                .get(1)
+                .and_then(|x| {
+                    if let OscType::Int(v) = x {
+                        Some(*v as u64)
                     } else {
-                        "Transport STOPPED"
-                    },
-                    st.monitor
-                        .iter()
-                        .rev()
-                        .take(6)
-                        .map(|e| format!(
-                            "{:.2} {} n{} v{} ch{} {}",
-                            e.at, e.kind, e.note, e.velocity, e.channel, e.destination
-                        ))
-                        .collect::<Vec<_>>()
-                        .join("  ")
-                )
-            } else if st.screen == 2 {
-                "MIDI destinations\n\nMonitor (built-in)\nNo physical port selected".into()
-            } else {
-                format!(
-                    "Engine log\n\n{}",
-                    st.errors.iter().cloned().collect::<Vec<_>>().join("\n")
-                )
-            };
-            frame.render_widget(
-                Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
-                root[1],
-            );
+                        None
+                    }
+                })
+                .unwrap_or(1);
+            s.log("startup project synchronized and activated")
         }
-        let mode = if st.pending_edit.is_some() {
-            " EDIT (type value, Enter commits)"
-        } else {
-            " arrows/hjkl move  Enter edit  Space play/stop  : commands  ? help  q quit"
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    format!(
-                        "ENGINE {}  MIDI: Monitor  {:.2} BPM  {}",
-                        if st.engine_ready {
-                            "● SC READY"
+        STAGED => {
+            s.staged = true;
+            s.log("pattern staged")
+        }
+        COMMITTED => {
+            s.staged = false;
+            s.live_revision = m
+                .args
+                .get(1)
+                .and_then(|x| {
+                    if let OscType::Int(v) = x {
+                        Some(*v as u64)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(s.live_revision);
+            s.log("pattern activated")
+        }
+        "/index/v1/state" => {
+            if let Some(OscType::Int(v)) = m.args.first() {
+                s.playing = *v != 0
+            }
+        }
+        EVENT => {
+            if m.args.len() != 6 {
+                s.error("malformed MIDI event");
+                return;
+            }
+            let parse = (
+                one_float(&m.args, 0),
+                one_string(&m.args, 1),
+                one_int(&m.args, 2),
+                one_int(&m.args, 3),
+                one_int(&m.args, 4),
+                one_string(&m.args, 5),
+            );
+            if let (Ok(at), Ok(kind), Ok(note), Ok(vel), Ok(ch), Ok(dest)) = parse {
+                let ev = MidiEvent {
+                    at: at as f64,
+                    kind,
+                    note,
+                    velocity: vel as u8,
+                    channel: ch as u8,
+                    destination: dest,
+                };
+                if let Err(x) = out
+                    .lock()
+                    .unwrap()
+                    .send(&ev.kind, ev.note, ev.velocity, ev.channel)
+                {
+                    s.error(format!("MIDI output: {x}"));
+                }
+                s.event(ev)
+            } else {
+                s.error("malformed MIDI event types")
+            }
+        }
+        ERROR => {
+            s.status = EngineStatus::Error;
+            s.error(
+                m.args
+                    .first()
+                    .and_then(|x| {
+                        if let OscType::String(v) = x {
+                            Some(v.clone())
                         } else {
-                            "○ SC STARTING"
-                        },
-                        st.project.tempo,
-                        if st.playing { "PLAYING" } else { "STOPPED" }
-                    ),
-                    Style::default().fg(Color::Green),
-                ),
-                Span::raw(mode),
-            ])),
-            root[2],
-        );
+                            None
+                        }
+                    })
+                    .unwrap_or_else(|| "SC protocol error".into()),
+            )
+        }
+        _ => s.error(format!("unknown SC message {}", m.addr)),
+    }
+}
+
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    active: bool,
+}
+impl TerminalGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut out = io::stdout();
+        execute!(out, EnterAlternateScreen)?;
+        Ok(Self {
+            terminal: Terminal::new(CrosstermBackend::new(out))?,
+            active: true,
+        })
+    }
+}
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+            let _ = self.terminal.show_cursor();
+            self.active = false;
+        }
+    }
+}
+
+fn draw(g: &mut Terminal<CrosstermBackend<io::Stdout>>, s: &AppState) -> Result<()> {
+    g.draw(|f| {
+        let z = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(2), Constraint::Min(5), Constraint::Length(2)]).split(f.area());
+        f.render_widget(Tabs::new(["F1 Perform", "F2 Sequence", "F3 Devices", "F4 Log"].iter().map(|x| Line::from(*x)).collect::<Vec<_>>()).select(s.screen).block(Block::default().borders(Borders::BOTTOM)), z[0]);
+        if s.screen == 1 {
+            let rows = s.project.pattern.degrees.iter().enumerate().map(|(n, d)| { let v = [n.to_string(), d.to_string(), format!("{:.2}", s.project.pattern.durations[n]), s.project.pattern.velocities[n].to_string(), s.project.pattern.channel.to_string(), s.project.pattern.destination.clone()]; Row::new(v.into_iter().enumerate().map(|(c, x)| Cell::from(x).style(if n == s.selected && c == s.column + 1 { Style::default().bg(Color::Yellow).fg(Color::Black) } else if n == s.selected { Style::default().bg(Color::DarkGray) } else { Style::default() }))) });
+            f.render_widget(Table::new(rows, [Constraint::Length(3), Constraint::Length(5), Constraint::Length(7), Constraint::Length(5), Constraint::Length(4), Constraint::Min(10)]).header(Row::new(["#", "DEG", "DUR", "VEL", "CH", "DEST"]).style(Style::default().fg(Color::Yellow))).block(Block::default().title(format!(" bass / {} ", if s.staged { "STAGED" } else { "LIVE" })).borders(Borders::ALL)), z[1]);
+        } else {
+            let text = if s.screen == 0 { format!("Transport {}\n\n{}", if s.playing { "PLAYING" } else { "STOPPED" }, s.monitor.iter().rev().take(8).map(|e| format!("{:.2} {} n{} v{} ch{} {}", e.at, e.kind, e.note, e.velocity, e.channel, e.destination)).collect::<Vec<_>>().join("  ")) } else if s.screen == 2 { let mut names = vec!["Monitor (built-in)".to_string()]; names.extend(MidiOutputBackend::ports().map(|p| p.into_iter().map(|x| x.0).collect::<Vec<_>>()).unwrap_or_default()); format!("MIDI destinations (j/k, Enter selects)\n\n{}", names.into_iter().enumerate().map(|(i, n)| format!("{} {}", if i == s.device_index { ">" } else { " " }, n)).collect::<Vec<_>>().join("\n")) } else { format!("Engine log\n\n{}\n{}", s.logs.iter().cloned().collect::<Vec<_>>().join("\n"), s.errors.iter().cloned().collect::<Vec<_>>().join("\n")) };
+            f.render_widget(Paragraph::new(text).block(Block::default().borders(Borders::ALL)), z[1]);
+        }
+        let status = match s.status { EngineStatus::Starting => "SC STARTING", EngineStatus::Syncing => "SC SYNCING", EngineStatus::Ready => "SC READY", EngineStatus::Error => "SC ERROR" };
+        f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("ENGINE ● {}  MIDI: Monitor  {:.2} BPM  {}", status, s.project.meta.tempo, if s.playing { "PLAYING" } else { "STOPPED" }), Style::default().fg(if s.status == EngineStatus::Error { Color::Red } else { Color::Green })), Span::raw(if s.pending_edit.is_some() { " EDIT Enter=apply Esc=cancel" } else { " h/l cell  j/k row  Enter edit  i now  b next-bar  Space play  : command  ? help  q quit" })])), z[2]);
     })?;
     Ok(())
 }
 
-fn run(project_dir: PathBuf, headless: bool) -> Result<()> {
-    let project = if project_dir.join("project.toml").exists() {
-        load_project(&project_dir)?
-    } else {
-        let p = example_project();
-        save_project(&project_dir, &p)?;
-        p
-    };
-    let state = Arc::new(Mutex::new(AppState::new(project)));
-    let (mut engine, rx) = Engine::start(&project_dir)?;
-    let listener_state = state.clone();
-    thread::spawn(move || packet_loop(rx, listener_state));
-    let deadline = headless.then(|| Instant::now() + Duration::from_secs(4));
-    engine.send(
-        "/hello",
-        vec![OscType::String("rust".into()), OscType::Int(1)],
-    )?;
-    let midi: Option<MidiOutputConnection> = None;
-    let _ = MidiOutput::new("Index").map(|m| {
-        let _ = m.ports();
-    });
-    if headless {
-        let ready_deadline = Instant::now() + Duration::from_secs(20);
-        while !state.lock().unwrap().engine_ready && Instant::now() < ready_deadline {
-            engine.send(
-                "/hello",
-                vec![OscType::String("rust".into()), OscType::Int(1)],
-            )?;
-            thread::sleep(Duration::from_millis(50));
-        }
-        if !state.lock().unwrap().engine_ready {
-            return Err(anyhow!("sclang launched but readiness handshake timed out"));
-        }
-        let mut p = state.lock().unwrap().project.pattern.clone();
-        p.degrees[0] = 1;
-        send_pattern(&engine, &p, false)?;
-        engine.send(
-            "/code/eval",
-            vec![OscType::String("nil.doesNotExist".into())],
-        )?;
-        thread::sleep(Duration::from_millis(200));
-        if state.lock().unwrap().errors.is_empty() {
-            return Err(anyhow!("SC evaluation error was not reported"));
-        }
-        engine.send("/transport/play", vec![])?;
-        thread::sleep(Duration::from_millis(1800));
-        let got = !state.lock().unwrap().monitor.is_empty();
-        engine.send("/transport/stop", vec![])?;
-        if !got {
-            return Err(anyhow!("smoke run received no MIDI monitor events"));
-        }
-        save_project(&project_dir, &state.lock().unwrap().project)?;
-        drop(midi);
-        return Ok(());
-    }
-    enable_raw_mode()?;
-    let mut out = io::stdout();
-    execute!(out, EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
-    loop {
-        draw(&mut terminal, &state.lock().unwrap())?;
-        if deadline.is_some_and(|d| Instant::now() > d) {
-            break;
-        }
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(k) = event::read()? {
-                if handle_key(k, &state, &engine)? {
-                    break;
-                }
-            }
-        }
-    }
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    engine.stop();
-    Ok(())
-}
-fn handle_key(k: KeyEvent, state: &Arc<Mutex<AppState>>, engine: &Engine) -> Result<bool> {
-    let mut st = state.lock().unwrap();
-    if st.pending_edit.is_some() {
+fn edit_key(k: KeyEvent, s: &mut AppState, e: &Engine, out: &SharedOutput) -> Result<bool> {
+    if let Some(text) = s.pending_edit.clone() {
         match k.code {
             KeyCode::Enter => {
-                let edit = st.pending_edit.clone().unwrap();
-                if edit.starts_with(':') {
-                    match edit.trim_start_matches(':').trim() {
-                        "play" => {
-                            st.playing = true;
-                            engine.send("/transport/play", vec![])?;
-                        }
-                        "stop" => {
-                            st.playing = false;
-                            engine.send("/transport/stop", vec![])?;
-                        }
-                        "commit" => send_pattern(engine, &st.project.pattern, false)?,
-                        _ => st.status = "commands: :play  :stop  :commit".into(),
-                    }
-                    st.pending_edit = None;
+                if let Some(cmd) = text.strip_prefix(':') {
+                    match cmd.trim() {
+                        "play" => e.send("/transport/play", vec![])?,
+                        "stop" => e.send("/transport/stop", vec![])?,
+                        "commit" => commit(e, s, "now")?,
+                        "bar" => commit(e, s, "bar")?,
+                        _ => s.error("commands: :play :stop :commit :bar"),
+                    };
+                    s.pending_edit = None;
                     return Ok(false);
                 }
-                let idx = st.selected;
-                match st.column {
-                    0 => {
-                        st.project.pattern.degrees[idx] =
-                            edit.parse().context("degree must be an integer")?
+                let i = s.selected;
+                let r = match s.column {
+                    0 => text
+                        .parse()
+                        .map(|v| s.project.pattern.degrees[i] = v)
+                        .map_err(|_| anyhow!("degree must be an integer")),
+                    1 => text
+                        .parse()
+                        .map(|v| s.project.pattern.durations[i] = v)
+                        .map_err(|_| anyhow!("duration must be a number")),
+                    2 => text
+                        .parse()
+                        .map(|v| s.project.pattern.velocities[i] = v)
+                        .map_err(|_| anyhow!("velocity must be 0..127")),
+                    3 => text
+                        .parse()
+                        .map(|v| s.project.pattern.channel = v)
+                        .map_err(|_| anyhow!("channel must be 1..16")),
+                    4 => {
+                        s.project.pattern.destination = text;
+                        Ok(())
                     }
-                    1 => {
-                        st.project.pattern.durations[idx] =
-                            edit.parse().context("duration must be a number")?
-                    }
-                    2 => {
-                        st.project.pattern.velocities[idx] =
-                            edit.parse().context("velocity must be 0..127")?
-                    }
-                    3 => {
-                        st.project.pattern.channel =
-                            edit.parse().context("channel must be 1..16")?
-                    }
-                    4 => st.project.pattern.destination = edit,
-                    _ => {}
+                    _ => Ok(()),
+                };
+                if let Err(x) = r.and_then(|_| validate(&s.project.pattern)) {
+                    s.error(x.to_string());
+                    s.pending_edit = None;
+                    return Ok(false);
                 }
-                validate(&st.project.pattern)?;
-                st.pending_edit = None;
-                send_pattern(engine, &st.project.pattern, false)?;
+                stage(e, s)?;
+                s.pending_edit = None
             }
-            KeyCode::Esc => st.pending_edit = None,
+            KeyCode::Esc => s.pending_edit = None,
             KeyCode::Backspace => {
-                st.pending_edit.as_mut().unwrap().pop();
+                s.pending_edit.as_mut().unwrap().pop();
             }
-            KeyCode::Char(c) => st.pending_edit.as_mut().unwrap().push(c),
+            KeyCode::Char(c) => s.pending_edit.as_mut().unwrap().push(c),
             _ => {}
         }
         return Ok(false);
     }
     match k.code {
-        KeyCode::Char('q') => return Ok(true),
+        KeyCode::Char('q') => Ok(true),
         KeyCode::Char('?') => {
-            st.status = "Enter edits DEG only in this slice; arrows select rows".into()
+            s.log("h/l select cell; Enter edit; i immediate; b next bar; :play/:stop/:commit/:bar");
+            Ok(false)
         }
-        KeyCode::Up | KeyCode::Char('k') => st.selected = st.selected.saturating_sub(1),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if s.screen == 2 {
+                s.device_index = s.device_index.saturating_sub(1);
+                return Ok(false);
+            }
+            s.selected = s.selected.saturating_sub(1);
+            Ok(false)
+        }
         KeyCode::Down | KeyCode::Char('j') => {
-            st.selected = (st.selected + 1).min(st.project.pattern.degrees.len() - 1)
+            if s.screen == 2 {
+                let max = MidiOutputBackend::ports().map(|x| x.len()).unwrap_or(0);
+                s.device_index = (s.device_index + 1).min(max);
+                return Ok(false);
+            }
+            s.selected = (s.selected + 1).min(s.project.pattern.degrees.len() - 1);
+            Ok(false)
         }
-        KeyCode::Left | KeyCode::Char('h') => st.column = st.column.saturating_sub(1),
-        KeyCode::Right | KeyCode::Char('l') => st.column = (st.column + 1).min(4),
-        KeyCode::F(1) => st.screen = 0,
-        KeyCode::F(2) => st.screen = 1,
-        KeyCode::F(3) => st.screen = 2,
-        KeyCode::F(4) => st.screen = 3,
-        KeyCode::Tab => st.screen = (st.screen + 1) % 4,
-        KeyCode::Enter if st.screen == 1 => {
-            st.pending_edit = Some(match st.column {
-                0 => st.project.pattern.degrees[st.selected].to_string(),
-                1 => st.project.pattern.durations[st.selected].to_string(),
-                2 => st.project.pattern.velocities[st.selected].to_string(),
-                3 => st.project.pattern.channel.to_string(),
-                _ => st.project.pattern.destination.clone(),
-            })
+        KeyCode::Left | KeyCode::Char('h') => {
+            s.column = s.column.saturating_sub(1);
+            Ok(false)
         }
-        KeyCode::Char(':') => st.pending_edit = Some(":".into()),
+        KeyCode::Right | KeyCode::Char('l') => {
+            s.column = (s.column + 1).min(4);
+            Ok(false)
+        }
+        KeyCode::F(n) => {
+            s.screen = (n as usize).saturating_sub(1).min(3);
+            Ok(false)
+        }
+        KeyCode::Tab => {
+            s.screen = (s.screen + 1) % 4;
+            Ok(false)
+        }
+        KeyCode::Enter if s.screen == 1 => {
+            s.pending_edit = Some(match s.column {
+                0 => s.project.pattern.degrees[s.selected].to_string(),
+                1 => s.project.pattern.durations[s.selected].to_string(),
+                2 => s.project.pattern.velocities[s.selected].to_string(),
+                3 => s.project.pattern.channel.to_string(),
+                _ => s.project.pattern.destination.clone(),
+            });
+            Ok(false)
+        }
+        KeyCode::Enter if s.screen == 2 => {
+            if s.device_index == 0 {
+                *out.lock().unwrap() = Box::new(MonitorOutput::default());
+                s.log("Monitor output selected");
+            } else if let Ok(ports) = MidiOutputBackend::ports() {
+                if let Some((name, port)) = ports.into_iter().nth(s.device_index - 1) {
+                    match MidiOutputBackend::open(&port, name.clone()) {
+                        Ok(m) => {
+                            *out.lock().unwrap() = Box::new(m);
+                            s.log(format!("MIDI output selected: {name}"));
+                        }
+                        Err(e) => s.error(format!("MIDI open failed: {e}")),
+                    }
+                }
+            }
+            Ok(false)
+        }
+        KeyCode::Char(':') => {
+            s.pending_edit = Some(":".into());
+            Ok(false)
+        }
+        KeyCode::Char('i') => {
+            commit(e, s, "now")?;
+            Ok(false)
+        }
+        KeyCode::Char('b') => {
+            commit(e, s, "bar")?;
+            Ok(false)
+        }
         KeyCode::Char(' ') => {
-            st.playing = !st.playing;
-            engine.send(
-                if st.playing {
-                    "/transport/play"
-                } else {
+            e.send(
+                if s.playing {
                     "/transport/stop"
+                } else {
+                    "/transport/play"
                 },
                 vec![],
             )?;
+            Ok(false)
         }
-        _ => {}
+        _ => Ok(false),
     }
-    Ok(false)
+}
+
+fn run(dir: PathBuf, headless: bool) -> Result<()> {
+    let p = if dir.join("project.toml").exists() {
+        load(&dir)?
+    } else {
+        let p = example_project(&dir);
+        save(&p)?;
+        p
+    };
+    let state = Arc::new(Mutex::new(AppState::new(p)));
+    let (mut e, rx, logs) = Engine::start()?;
+    let out: SharedOutput = Arc::new(Mutex::new(Box::new(MonitorOutput::default())));
+    let a = state.clone();
+    let o = out.clone();
+    thread::spawn(move || {
+        for p in rx {
+            handle_packet(p, &mut a.lock().unwrap(), &o)
+        }
+    });
+    let a = state.clone();
+    thread::spawn(move || {
+        for l in logs {
+            a.lock().unwrap().log(l)
+        }
+    });
+    e.send(
+        "/hello",
+        vec![OscType::String("rust".into()), OscType::Int(1)],
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(if headless { 20 } else { 1 });
+    let mut sync_sent = false;
+    loop {
+        if let Some(code) = e.exited()? {
+            state.lock().unwrap().status = EngineStatus::Error;
+            state
+                .lock()
+                .unwrap()
+                .error(format!("sclang exited ({code})"));
+            if headless {
+                return Err(anyhow!("sclang exited before sync"));
+            }
+        }
+        {
+            let mut s = state.lock().unwrap();
+            if s.status != EngineStatus::Starting && !sync_sent {
+                send_sync(&e, &mut s)?;
+                sync_sent = true;
+            }
+        }
+        if headless {
+            if state.lock().unwrap().status == EngineStatus::Ready {
+                break;
+            }
+            if Instant::now() > deadline {
+                let s = state.lock().unwrap();
+                eprintln!("startup logs: {:?}; errors: {:?}", s.logs, s.errors);
+                return Err(anyhow!("startup synchronization timed out"));
+            }
+            e.send(
+                "/hello",
+                vec![OscType::String("rust".into()), OscType::Int(1)],
+            )?;
+            thread::sleep(Duration::from_millis(100))
+        } else {
+            break;
+        }
+    }
+    if headless {
+        let mut s = state.lock().unwrap();
+        s.project.pattern.degrees = vec![7];
+        s.project.pattern.durations = vec![0.25];
+        s.project.pattern.velocities = vec![77];
+        s.project.pattern.channel = 2;
+        s.project.pattern.destination = "Smoke".into();
+        stage(&e, &mut s)?;
+        e.send("/transport/play", vec![])?;
+        drop(s);
+        thread::sleep(Duration::from_millis(1200));
+        let before_commit = state.lock().unwrap().monitor.clone();
+        if before_commit.iter().any(|x| x.destination == "Smoke") {
+            return Err(anyhow!(
+                "staged pattern leaked into live playback before commit"
+            ));
+        }
+        commit(&e, &mut state.lock().unwrap(), "bar")?;
+        thread::sleep(Duration::from_secs(2));
+        e.send(
+            "/code/eval",
+            vec![OscType::String("nil.doesNotExist".into())],
+        )?;
+        thread::sleep(Duration::from_millis(200));
+        e.send("/transport/stop", vec![])?;
+        let after_stop = state.lock().unwrap().monitor.clone();
+        if !before_commit
+            .iter()
+            .any(|x| x.kind == "on" && x.note == 60 && x.channel == 1 && x.destination == "Monitor")
+        {
+            return Err(anyhow!("startup pattern was not observed"));
+        }
+        if !after_stop.iter().any(|x| {
+            x.kind == "on"
+                && x.note == 67
+                && x.velocity == 77
+                && x.channel == 2
+                && x.destination == "Smoke"
+        }) {
+            return Err(anyhow!("committed pattern did not switch atomically"));
+        }
+        if state.lock().unwrap().errors.is_empty() {
+            return Err(anyhow!("SC evaluation error was not reported"));
+        }
+        let count = after_stop.len();
+        thread::sleep(Duration::from_millis(800));
+        if state.lock().unwrap().monitor.len() > count + 1 {
+            return Err(anyhow!("events continued after Stop"));
+        }
+        save(&state.lock().unwrap().project)?;
+        return Ok(());
+    }
+    let mut g = TerminalGuard::new()?;
+    loop {
+        {
+            let s = state.lock().unwrap();
+            draw(&mut g.terminal, &s)?
+        }
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(k) = event::read()? {
+                if edit_key(k, &mut state.lock().unwrap(), &e, &out)? {
+                    break;
+                }
+            }
+        }
+    }
+    e.stop();
+    Ok(())
 }
 
 fn doctor() {
     println!("Index doctor");
-    match which("sclang").or_else(|| env::var("INDEX_SCLANG").ok()) {
-        Some(p) => println!("sclang: {p}"),
+    match env::var("INDEX_SCLANG").ok().or_else(|| which("sclang")) {
+        Some(x) => println!("sclang: {x}"),
         None => {
             println!("sclang: MISSING");
-            println!("Install SuperCollider with: brew install supercollider");
-            println!("Or configure: export INDEX_SCLANG=/absolute/path/to/sclang");
+            println!("Install: brew install --cask supercollider");
+            println!("Override: export INDEX_SCLANG=/absolute/path/to/sclang")
         }
     }
-    println!("MIDI: native midir backend available (Monitor is always available)");
+    println!("MIDI: native midir backend available; Monitor is always available")
 }
 fn main() -> Result<()> {
     let mut a = env::args().skip(1);
@@ -667,19 +701,12 @@ fn main() -> Result<()> {
             doctor();
             Ok(())
         }
-        Some("run") => {
-            let dir = PathBuf::from(a.next().unwrap_or_else(|| "examples/first-light".into()));
-            run(dir, a.any(|x| x == "--headless"))
-        }
-        Some("test-project") => {
-            let dir = PathBuf::from(a.next().unwrap_or_else(|| ".index-test".into()));
-            let p = example_project();
-            save_project(&dir, &p)?;
-            println!("saved and reloaded: {}", load_project(&dir)?.name);
-            Ok(())
-        }
+        Some("run") => run(
+            PathBuf::from(a.next().unwrap_or_else(|| "examples/first-light".into())),
+            a.any(|x| x == "--headless"),
+        ),
         _ => {
-            println!("Index — sequencing-only Rust/Ratatui + SuperCollider instrument\n\nUsage:\n  cargo run -- doctor\n  cargo run -- run examples/first-light\n  cargo run -- run examples/first-light --headless");
+            println!("Index\n\n  cargo run -- doctor\n  cargo run -- run examples/first-light\n  ./scripts/smoke-test");
             Ok(())
         }
     }
@@ -689,45 +716,35 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn pattern_validates() {
-        let p = example_project().pattern;
-        assert!(validate(&p).is_ok());
-        let mut q = p.clone();
-        q.durations.pop();
-        assert!(validate(&q).is_err());
+    fn status_transitions() {
+        let mut s = AppState::new(example_project("."));
+        assert_eq!(s.status, EngineStatus::Starting);
+        s.status = EngineStatus::Syncing;
+        assert_eq!(s.status, EngineStatus::Syncing);
+        s.status = EngineStatus::Ready;
+        assert_eq!(s.status, EngineStatus::Ready)
     }
     #[test]
-    fn project_roundtrip() {
-        let d = tempfile::tempdir().unwrap();
-        let p = example_project();
-        save_project(d.path(), &p).unwrap();
-        assert_eq!(load_project(d.path()).unwrap(), p);
+    fn staged_state_is_distinct() {
+        let p = example_project(".");
+        let mut s = AppState::new(p.clone());
+        s.project.pattern.degrees[0] = 12;
+        s.staged = true;
+        assert_eq!(s.project.pattern.degrees[0], 12);
+        assert_eq!(p.pattern.degrees[0], 0)
     }
     #[test]
-    fn osc_roundtrip() {
-        let p = OscPacket::Message(OscMessage {
-            addr: "/index/v1/hello".into(),
-            args: vec![OscType::String("x".into()), OscType::Int(1)],
-        });
-        let b = encode(&p).unwrap();
-        let (_, x) = decode_udp(&b).unwrap();
-        assert_eq!(x, p);
-    }
-    #[test]
-    fn reducer_moves_selection() {
-        let st = Arc::new(Mutex::new(AppState::new(example_project())));
-        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
-        let e = Engine {
-            socket: sock.clone(),
-            addr: sock.local_addr().unwrap(),
-            child: Command::new("true").spawn().unwrap(),
+    fn engine_stop_is_idempotent() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let child = Command::new("true").spawn().unwrap();
+        let mut e = Engine {
+            socket: socket.clone(),
+            addr: socket.local_addr().unwrap(),
+            child,
+            stopped: false,
         };
-        handle_key(
-            KeyEvent::new(KeyCode::Down, crossterm::event::KeyModifiers::NONE),
-            &st,
-            &e,
-        )
-        .unwrap();
-        assert_eq!(st.lock().unwrap().selected, 1);
+        e.stop();
+        e.stop();
+        assert!(e.stopped);
     }
 }

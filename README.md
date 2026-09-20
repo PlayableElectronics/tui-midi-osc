@@ -15,16 +15,16 @@ cargo run -- run examples/first-light
 cargo test
 ```
 
-Set `INDEX_SCLANG=/absolute/path/to/sclang` to override discovery. The built-in Monitor destination makes the demo usable without MIDI hardware. A future native-port selector persists logical destination names alongside the system port name; absent ports are diagnosed rather than silently remapped.
+Set `INDEX_SCLANG=/absolute/path/to/sclang` to override discovery. The built-in Monitor destination makes the demo usable without MIDI hardware. The Devices screen lists native ports and Enter opens a selected port; a missing saved destination is never silently remapped.
 
 ## Controls
 
-`F1` Perform, `F2` Sequence, `F3` Devices, `F4` Code/Log; arrows or `hjkl` move; `Tab` changes panes; `Enter` edits the selected degree; `Space` plays/stops; `?` shows contextual help; `q` quits and stops the supervised engine. The tracker currently edits degree values in the UI; duration, velocity, channel, and destination are displayed and supported by the structured protocol/project format.
+`F1` Perform, `F2` Sequence, `F3` Devices, `F4` Log; `h/l` select a tracker cell, `j/k` select a row, `Tab` changes screens, `Enter` edits degree/duration/velocity/channel/destination, `i` commits immediately, `b` commits on the next bar, `Space` plays/stops, `:` enters `:play`, `:stop`, `:commit`, or `:bar`, `?` shows help, and `q` quits with terminal restoration.
 
 ## Project layout and protocol
 
-Projects contain `project.toml`, `patterns/bass.toml`, and free `live/session.scd`. Writes use a temporary file and rename. The protocol is documented in `ARCHITECTURE.md`; the core paths are `/index/v1/hello`, `/ready`, `/transport/play`, `/transport/stop`, `/tempo`, `/pattern/set`, `/pattern/commit`, `/code/eval`, `/event/midi`, `/error`, and `/state`.
+Projects contain metadata/reference in `project.toml`, the authoritative managed pattern in `patterns/bass.toml`, and free `live/session.scd`. Every valuable file is written through a same-directory temporary file, synced, and renamed. The protocol is documented in `ARCHITECTURE.md`; `./scripts/smoke-test` uses a temporary project copy.
 
 ## Limitations and direction
 
-This is the first vertical slice: one managed pattern, one monitor destination, degree editing, and a compact UI. Physical MIDI output discovery and richer cell editors are intentionally next steps. The longer-term direction includes modular sequencing tools inspired by ixiQuarks/ixi lang, reusable agents, arrangements/scenes, device profiles, modulation, and NerdSEQ/Dyaxis/OSC-node integrations. Those are future work, not hidden promises of this prototype.
+The managed pattern is authoritative in `patterns/bass.toml`; `project.toml` contains only metadata and the pattern reference. Startup is an explicit `/ready` then `/project/sync` handshake, and edits are staged until an immediate or next-bar commit. The Monitor backend is always available; Devices lists native `midir` ports and Enter opens a selected port without silently remapping a missing destination. The longer-term direction includes modular sequencing tools inspired by ixiQuarks/ixi lang, reusable agents, arrangements/scenes, device profiles, modulation, and NerdSEQ/Dyaxis/OSC-node integrations. Those are future work, not hidden promises of this prototype.

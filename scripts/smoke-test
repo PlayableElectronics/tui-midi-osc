@@ -6,5 +6,8 @@ if ! command -v sclang >/dev/null 2>&1 && [ -z "${INDEX_SCLANG:-}" ]; then
   echo "sclang is required for the smoke test. Run: cargo run -- doctor" >&2
   exit 2
 fi
-cargo run --quiet -- run examples/first-light --headless
-echo "smoke test passed: handshake, pattern update, SC MIDI event, monitor delivery, shutdown"
+TMP_PROJECT=$(mktemp -d "${TMPDIR:-/tmp}/index-smoke.XXXXXX")
+trap 'rm -rf "$TMP_PROJECT"' EXIT
+cp -R examples/first-light/. "$TMP_PROJECT/"
+cargo run --quiet -- run "$TMP_PROJECT" --headless
+echo "smoke test passed: handshake, startup sync, staged/live commit path, monitor delivery, shutdown"
