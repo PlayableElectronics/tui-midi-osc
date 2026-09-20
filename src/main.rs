@@ -8,7 +8,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use midi::{MidiOutputBackend, MonitorOutput, SharedOutput};
+use midi::{MidiOutputBackend, MonitorOutput, OutputQueue, SharedOutput};
 use project::{example_project, load, save, validate, Pattern, Project};
 use protocol::*;
 use ratatui::{
@@ -64,6 +64,8 @@ struct AppState {
     logs: VecDeque<String>,
     errors: VecDeque<String>,
     request: u64,
+    local_epoch: Instant,
+    sc_offset: f64,
 }
 impl AppState {
     fn new(project: Project) -> Self {
@@ -83,6 +85,8 @@ impl AppState {
             logs: VecDeque::new(),
             errors: VecDeque::new(),
             request: 1,
+            local_epoch: Instant::now(),
+            sc_offset: 0.0,
         }
     }
     fn next_request(&mut self) -> String {
@@ -252,11 +256,14 @@ fn commit(e: &Engine, s: &mut AppState, mode: &str) -> Result<()> {
     )
 }
 
-fn handle_packet(p: OscPacket, s: &mut AppState, out: &SharedOutput) {
+fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
     let OscPacket::Message(m) = p else { return };
     match m.addr.as_str() {
         READY => {
             if s.status == EngineStatus::Starting {
+                if let Some(OscType::Float(sc_time)) = m.args.get(1) {
+                    s.sc_offset = s.local_epoch.elapsed().as_secs_f64() - (*sc_time as f64);
+                }
                 s.status = EngineStatus::Syncing;
                 s.log("SC READY; synchronizing project");
             }
@@ -323,11 +330,14 @@ fn handle_packet(p: OscPacket, s: &mut AppState, out: &SharedOutput) {
                     channel: ch as u8,
                     destination: dest,
                 };
-                if let Err(x) = out
-                    .lock()
-                    .unwrap()
-                    .send(&ev.kind, ev.note, ev.velocity, ev.channel)
-                {
+                let due = (ev.at + s.sc_offset - s.local_epoch.elapsed().as_secs_f64()).max(0.0);
+                if let Err(x) = queue.send_at(
+                    Instant::now() + Duration::from_secs_f64(due),
+                    ev.kind.clone(),
+                    ev.note,
+                    ev.velocity,
+                    ev.channel,
+                ) {
                     s.error(format!("MIDI output: {x}"));
                 }
                 s.event(ev)
@@ -558,10 +568,11 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
     let (mut e, rx, logs) = Engine::start()?;
     let out: SharedOutput = Arc::new(Mutex::new(Box::new(MonitorOutput::default())));
     let a = state.clone();
-    let o = out.clone();
+    let queue = Arc::new(OutputQueue::new(out.clone()));
+    let q = queue.clone();
     thread::spawn(move || {
         for p in rx {
-            handle_packet(p, &mut a.lock().unwrap(), &o)
+            handle_packet(p, &mut a.lock().unwrap(), &q)
         }
     });
     let a = state.clone();
@@ -667,7 +678,10 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
     let mut g = TerminalGuard::new()?;
     loop {
         {
-            let s = state.lock().unwrap();
+            let mut s = state.lock().unwrap();
+            for error in queue.drain_errors() {
+                s.error(format!("MIDI output: {error}"));
+            }
             draw(&mut g.terminal, &s)?
         }
         if event::poll(Duration::from_millis(100))? {
