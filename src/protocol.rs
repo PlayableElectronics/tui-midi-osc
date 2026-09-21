@@ -13,6 +13,8 @@ pub const COMMIT: &str = "/index/v1/pattern/commit";
 pub const COMMITTED: &str = "/index/v1/pattern/committed";
 pub const EVENT: &str = "/index/v1/event/midi";
 pub const ERROR: &str = "/index/v1/error";
+pub const CANCELLED: &str = "/index/v1/request/cancelled";
+pub const SUPERSEDED: &str = "/index/v1/request/superseded";
 
 pub fn strings(xs: &[OscType], start: usize) -> Result<Vec<String>> {
     xs.get(start..)

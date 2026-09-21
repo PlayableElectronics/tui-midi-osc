@@ -431,6 +431,25 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
                 .unwrap_or(s.live_revision);
             s.log("pattern activated")
         }
+        CANCELLED | SUPERSEDED => {
+            let Some(OscType::String(id)) = m.args.first() else {
+                s.error("malformed request terminal response");
+                return;
+            };
+            if s.pending_requests.remove(id).is_none() {
+                s.error(format!("late request terminal response: {id}"));
+                return;
+            }
+            s.staged = false;
+            s.log(format!(
+                "request {id} {}",
+                if m.addr == CANCELLED {
+                    "cancelled"
+                } else {
+                    "superseded"
+                }
+            ));
+        }
         "/index/v1/state" => {
             if let Some(OscType::Int(v)) = m.args.first() {
                 s.playing = *v != 0;

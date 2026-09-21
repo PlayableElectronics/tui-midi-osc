@@ -4,7 +4,7 @@ var rustPort = "INDEX_RUST_PORT".getenv.asInteger;
 var scPort = "INDEX_SC_PORT".getenv.asInteger;
 var rust = NetAddr("127.0.0.1", rustPort);
 var clock = TempoClock(2.0);
-var staged, live, stream, runner, playing = false, active = Set.new, pendingToken = 0;
+var staged, live, stream, runner, playing = false, active = Set.new, pendingToken = 0, pendingReq = nil;
 var parseInts, parseFloats, parsePattern, emit, stop, activate, play, handle;
 
 staged = (name: "bass", degrees: [0], durations: [1.0], velocities: [100], gate: 0.8, channel: 1, destination: "Monitor", revision: 0);
@@ -24,6 +24,7 @@ emit = { |kind, note, velocity, channel, destination|
     rust.sendMsg("/index/v1/event/midi", Main.elapsedTime, kind, note, velocity, channel, destination);
 };
 stop = {
+    if(pendingReq.notNil) { rust.sendMsg("/index/v1/request/cancelled", pendingReq, "stop"); pendingReq = nil; pendingToken = pendingToken + 1 };
     playing = false;
     if(runner.notNil) { runner.stop; runner = nil };
     active.copy.do({ |x| emit.("off", x[0], 0, x[1], x[2]) });
@@ -34,10 +35,14 @@ activate = { |mode, req, revision|
     var token;
     snapshot.revision = revision;
     if(mode == "bar") {
+        if(pendingReq.notNil) { rust.sendMsg("/index/v1/request/superseded", pendingReq, req); };
         pendingToken = pendingToken + 1;
         token = pendingToken;
-        clock.schedAbs(clock.nextBar, { if(token == pendingToken) { live = snapshot.copy; if(playing) { stop.(); play.() }; rust.sendMsg("/index/v1/pattern/committed", req, revision, mode, clock.beats) }; nil })
+        pendingReq = req;
+        clock.schedAbs(clock.nextBar, { if(token == pendingToken) { pendingReq = nil; live = snapshot.copy; if(playing) { stop.(); play.() }; rust.sendMsg("/index/v1/pattern/committed", req, revision, mode, clock.beats) }; nil })
     } {
+        if(pendingReq.notNil) { rust.sendMsg("/index/v1/request/superseded", pendingReq, req); };
+        pendingReq = nil;
         pendingToken = pendingToken + 1;
         live = snapshot.copy;
         if(playing) { stop.(); play.() };

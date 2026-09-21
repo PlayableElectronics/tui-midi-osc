@@ -3,7 +3,7 @@ use midir::{MidiOutput, MidiOutputConnection, MidiOutputPort};
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
-    collections::HashSet,
+    collections::HashMap,
     collections::VecDeque,
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -29,6 +29,7 @@ pub fn note_bytes(kind: &str, note: i32, velocity: u8, channel: u8) -> Result<[u
 
 pub trait OutputBackend: Send {
     fn send(&mut self, kind: &str, note: i32, velocity: u8, channel: u8) -> Result<()>;
+    fn control_change(&mut self, controller: u8, value: u8, channel: u8) -> Result<()>;
 }
 #[derive(Default)]
 pub struct MonitorOutput {
@@ -37,6 +38,13 @@ pub struct MonitorOutput {
 impl OutputBackend for MonitorOutput {
     fn send(&mut self, kind: &str, note: i32, velocity: u8, channel: u8) -> Result<()> {
         self.events.push(note_bytes(kind, note, velocity, channel)?);
+        Ok(())
+    }
+    fn control_change(&mut self, controller: u8, value: u8, channel: u8) -> Result<()> {
+        if !(1..=16).contains(&channel) || controller > 127 || value > 127 {
+            return Err(anyhow!("invalid MIDI CC"));
+        }
+        self.events.push([0xB0 | (channel - 1), controller, value]);
         Ok(())
     }
 }
@@ -71,6 +79,14 @@ impl OutputBackend for MidiOutputBackend {
     fn send(&mut self, kind: &str, note: i32, velocity: u8, channel: u8) -> Result<()> {
         self.connection
             .send(&note_bytes(kind, note, velocity, channel)?)
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+    fn control_change(&mut self, controller: u8, value: u8, channel: u8) -> Result<()> {
+        if !(1..=16).contains(&channel) || controller > 127 || value > 127 {
+            return Err(anyhow!("invalid MIDI CC"));
+        }
+        self.connection
+            .send(&[0xB0 | (channel - 1), controller, value])
             .map_err(|e| anyhow!(e.to_string()))
     }
 }
@@ -124,7 +140,7 @@ impl OutputQueue {
         let worker = thread::spawn(move || {
             let mut heap = BinaryHeap::<Event>::new();
             let mut generation = 0_u64;
-            let mut active = HashSet::<(i32, u8)>::new();
+            let mut active = HashMap::<(i32, u8), u32>::new();
             loop {
                 let command = if let Some(event) = heap.peek() {
                     let wait = event.deadline.saturating_duration_since(Instant::now());
@@ -145,7 +161,7 @@ impl OutputQueue {
                         Command::Stop => {
                             generation += 1;
                             heap.clear();
-                            let notes: Vec<_> = active.iter().copied().collect();
+                            let notes: Vec<_> = active.keys().copied().collect();
                             for (note, channel) in notes {
                                 if let Err(error) =
                                     output.lock().unwrap().send("off", note, 0, channel)
@@ -155,6 +171,23 @@ impl OutputQueue {
                                         errors.pop_front();
                                     }
                                     errors.push_back(error.to_string());
+                                }
+                            }
+                            let channels: Vec<_> =
+                                active.keys().map(|(_, channel)| *channel).collect();
+                            for channel in channels {
+                                for (controller, value) in [(123, 0), (120, 0)] {
+                                    if let Err(error) = output
+                                        .lock()
+                                        .unwrap()
+                                        .control_change(controller, value, channel)
+                                    {
+                                        let mut errors = worker_errors.lock().unwrap();
+                                        if errors.len() >= 32 {
+                                            errors.pop_front();
+                                        }
+                                        errors.push_back(error.to_string());
+                                    }
                                 }
                             }
                             active.clear();
@@ -177,9 +210,14 @@ impl OutputQueue {
                         }
                         errors.push_back(error.to_string());
                     } else if event.kind == "on" {
-                        active.insert((event.note, event.channel));
+                        *active.entry((event.note, event.channel)).or_insert(0) += 1;
                     } else if event.kind == "off" {
-                        active.remove(&(event.note, event.channel));
+                        if let Some(count) = active.get_mut(&(event.note, event.channel)) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                active.remove(&(event.note, event.channel));
+                            }
+                        }
                     }
                 }
             }
@@ -250,6 +288,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(note_bytes(kind, note, velocity, channel)?);
+            Ok(())
+        }
+        fn control_change(&mut self, controller: u8, value: u8, channel: u8) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push([0xB0 | (channel - 1), controller, value]);
             Ok(())
         }
     }
@@ -349,9 +394,9 @@ mod tests {
         wait_for(&events, 1);
         q.stop_and_release();
         thread::sleep(Duration::from_millis(150));
-        assert_eq!(
-            events.lock().unwrap().as_slice(),
-            &[[0x90, 60, 100], [0x80, 60, 0]]
-        );
+        let events = events.lock().unwrap();
+        assert_eq!(&events[..2], &[[0x90, 60, 100], [0x80, 60, 0]]);
+        assert!(events.contains(&[0xB0, 123, 0]));
+        assert!(events.contains(&[0xB0, 120, 0]));
     }
 }
