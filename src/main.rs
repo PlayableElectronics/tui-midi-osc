@@ -21,7 +21,7 @@ use ratatui::{
 };
 use rosc::{decoder::decode_udp, encoder::encode, OscMessage, OscPacket, OscType};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     env, fs, io,
     net::{SocketAddr, UdpSocket},
     path::PathBuf,
@@ -37,6 +37,19 @@ enum EngineStatus {
     Syncing,
     Ready,
     Error,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestKind {
+    Sync,
+    Stage,
+    Commit,
+}
+#[derive(Debug, Clone)]
+struct RequestRecord {
+    kind: RequestKind,
+    revision: Option<u64>,
+    mode: Option<String>,
+    deadline: Instant,
 }
 #[derive(Debug, Clone)]
 struct MidiEvent {
@@ -66,7 +79,7 @@ struct AppState {
     request: u64,
     local_epoch: Instant,
     sc_offset: f64,
-    pending_requests: HashSet<String>,
+    pending_requests: HashMap<String, RequestRecord>,
 }
 impl AppState {
     fn new(project: Project) -> Self {
@@ -88,13 +101,30 @@ impl AppState {
             request: 1,
             local_epoch: Instant::now(),
             sc_offset: 0.0,
-            pending_requests: HashSet::new(),
+            pending_requests: HashMap::new(),
         }
     }
     fn next_request(&mut self) -> String {
         let x = format!("r{}", self.request);
         self.request += 1;
         x
+    }
+    fn register(
+        &mut self,
+        id: String,
+        kind: RequestKind,
+        revision: Option<u64>,
+        mode: Option<String>,
+    ) {
+        self.pending_requests.insert(
+            id,
+            RequestRecord {
+                kind,
+                revision,
+                mode,
+                deadline: Instant::now() + Duration::from_secs(3),
+            },
+        );
     }
     fn error(&mut self, text: impl Into<String>) {
         if self.errors.len() >= 32 {
@@ -228,7 +258,7 @@ fn pattern_args(req: &str, rev: u64, p: &Pattern) -> Vec<OscType> {
 }
 fn send_sync(e: &Engine, s: &mut AppState) -> Result<()> {
     let req = s.next_request();
-    s.pending_requests.insert(req.clone());
+    s.register(req.clone(), RequestKind::Sync, Some(1), None);
     s.status = EngineStatus::Syncing;
     let mut a = vec![OscType::String(req), OscType::Float(s.project.meta.tempo)];
     a.extend(
@@ -243,9 +273,9 @@ fn stage(e: &Engine, s: &mut AppState) -> Result<()> {
         return Err(anyhow!("SC is not synchronized yet"));
     }
     let req = s.next_request();
-    s.pending_requests.insert(req.clone());
     s.staged = false;
     let revision = s.staged_revision + 1;
+    s.register(req.clone(), RequestKind::Stage, Some(revision), None);
     e.send(
         "/pattern/set",
         pattern_args(&req, revision, &s.project.pattern),
@@ -259,7 +289,12 @@ fn commit(e: &Engine, s: &mut AppState, mode: &str) -> Result<()> {
         return Err(anyhow!("commit mode must be now or bar"));
     }
     let req = s.next_request();
-    s.pending_requests.insert(req.clone());
+    s.register(
+        req.clone(),
+        RequestKind::Commit,
+        Some(s.staged_revision),
+        Some(mode.into()),
+    );
     e.send(
         "/pattern/commit",
         vec![
@@ -268,6 +303,44 @@ fn commit(e: &Engine, s: &mut AppState, mode: &str) -> Result<()> {
             OscType::String(mode.into()),
         ],
     )
+}
+fn ack_record(s: &mut AppState, args: &[OscType], kind: RequestKind, revision: u64) -> bool {
+    let Some(OscType::String(id)) = args.first() else {
+        s.error("malformed acknowledgement request ID");
+        return false;
+    };
+    let Some(record) = s.pending_requests.get(id).cloned() else {
+        s.error(format!("late or duplicate acknowledgement: {id}"));
+        return false;
+    };
+    let mode_matches = kind != RequestKind::Commit
+        || record.mode.as_deref()
+            == args.get(2).and_then(|x| {
+                if let OscType::String(v) = x {
+                    Some(v.as_str())
+                } else {
+                    None
+                }
+            });
+    if record.kind != kind || record.revision != Some(revision) || !mode_matches {
+        s.error(format!("mismatched acknowledgement: {id}"));
+        return false;
+    }
+    s.pending_requests.remove(id);
+    true
+}
+fn expire_requests(s: &mut AppState) {
+    let now = Instant::now();
+    let expired: Vec<_> = s
+        .pending_requests
+        .iter()
+        .filter(|(_, r)| r.deadline <= now)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in expired {
+        s.pending_requests.remove(&id);
+        s.error(format!("request timed out: {id}"));
+    }
 }
 
 fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
@@ -291,11 +364,11 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
             if s.status != EngineStatus::Syncing {
                 return;
             }
-            let Some(OscType::String(req)) = m.args.first() else {
+            let Some(OscType::Int(revision)) = m.args.get(1) else {
                 s.error("malformed sync acknowledgement");
                 return;
             };
-            if !s.pending_requests.remove(req) {
+            if !ack_record(s, &m.args, RequestKind::Sync, *revision as u64) {
                 return;
             }
             s.status = EngineStatus::Ready;
@@ -315,11 +388,11 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
             s.log("startup project synchronized and activated")
         }
         STAGED => {
-            let Some(OscType::String(req)) = m.args.first() else {
+            let Some(OscType::Int(revision)) = m.args.get(1) else {
                 s.error("malformed stage acknowledgement");
                 return;
             };
-            if !s.pending_requests.remove(req) {
+            if !ack_record(s, &m.args, RequestKind::Stage, *revision as u64) {
                 return;
             }
             s.staged = true;
@@ -337,11 +410,11 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
             s.log("pattern staged")
         }
         COMMITTED => {
-            let Some(OscType::String(req)) = m.args.first() else {
+            let Some(OscType::Int(revision)) = m.args.get(1) else {
                 s.error("malformed commit acknowledgement");
                 return;
             };
-            if !s.pending_requests.remove(req) {
+            if !ack_record(s, &m.args, RequestKind::Commit, *revision as u64) {
                 return;
             }
             s.staged = false;
@@ -362,7 +435,7 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
             if let Some(OscType::Int(v)) = m.args.first() {
                 s.playing = *v != 0;
                 if *v == 0 {
-                    queue.cancel();
+                    queue.stop_and_release();
                 }
             }
         }
@@ -404,6 +477,9 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
             }
         }
         ERROR => {
+            if let Some(OscType::String(id)) = m.args.first() {
+                s.pending_requests.remove(id);
+            }
             let category = m
                 .args
                 .get(1)
@@ -707,7 +783,7 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
     } else {
         Some(TerminalGuard::new()?)
     };
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut last_hello = Instant::now() - Duration::from_secs(1);
     let mut last_sync = Instant::now() - Duration::from_secs(1);
     loop {
@@ -723,6 +799,7 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
         }
         {
             let mut s = state.lock().unwrap();
+            expire_requests(&mut s);
             if s.status == EngineStatus::Starting
                 && last_hello.elapsed() >= Duration::from_millis(250)
             {
@@ -877,7 +954,7 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
     let mut g = terminal.take().expect("interactive terminal");
     loop {
         if let Some(code) = e.exited()? {
-            queue.cancel();
+            queue.stop_and_release();
             let mut s = state.lock().unwrap();
             s.status = EngineStatus::Error;
             s.playing = false;

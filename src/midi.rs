@@ -3,6 +3,7 @@ use midir::{MidiOutput, MidiOutputConnection, MidiOutputPort};
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
+    collections::HashSet,
     collections::VecDeque,
     sync::{
         atomic::{AtomicU64, Ordering as AtomicOrdering},
@@ -112,7 +113,7 @@ impl Ord for Event {
 }
 enum Command {
     Event(Event),
-    Cancel,
+    Stop,
     Shutdown,
 }
 impl OutputQueue {
@@ -123,6 +124,7 @@ impl OutputQueue {
         let worker = thread::spawn(move || {
             let mut heap = BinaryHeap::<Event>::new();
             let mut generation = 0_u64;
+            let mut active = HashSet::<(i32, u8)>::new();
             loop {
                 let command = if let Some(event) = heap.peek() {
                     let wait = event.deadline.saturating_duration_since(Instant::now());
@@ -140,9 +142,22 @@ impl OutputQueue {
                 if let Some(command) = command {
                     match command {
                         Command::Event(event) => heap.push(event),
-                        Command::Cancel => {
+                        Command::Stop => {
                             generation += 1;
-                            heap.retain(|e| e.generation >= generation);
+                            heap.clear();
+                            let notes: Vec<_> = active.iter().copied().collect();
+                            for (note, channel) in notes {
+                                if let Err(error) =
+                                    output.lock().unwrap().send("off", note, 0, channel)
+                                {
+                                    let mut errors = worker_errors.lock().unwrap();
+                                    if errors.len() >= 32 {
+                                        errors.pop_front();
+                                    }
+                                    errors.push_back(error.to_string());
+                                }
+                            }
+                            active.clear();
                         }
                         Command::Shutdown => break,
                     }
@@ -161,6 +176,10 @@ impl OutputQueue {
                             errors.pop_front();
                         }
                         errors.push_back(error.to_string());
+                    } else if event.kind == "on" {
+                        active.insert((event.note, event.channel));
+                    } else if event.kind == "off" {
+                        active.remove(&(event.note, event.channel));
                     }
                 }
             }
@@ -193,9 +212,9 @@ impl OutputQueue {
             }))
             .map_err(|e| anyhow!(e.to_string()))
     }
-    pub fn cancel(&self) {
+    pub fn stop_and_release(&self) {
         self.generation.fetch_add(1, AtomicOrdering::Relaxed);
-        let _ = self.tx.send(Command::Cancel);
+        let _ = self.tx.send(Command::Stop);
     }
     pub fn shutdown(&self) {
         let _ = self.tx.send(Command::Shutdown);
@@ -307,9 +326,32 @@ mod tests {
             1,
         )
         .unwrap();
-        q.cancel();
+        q.stop_and_release();
         thread::sleep(Duration::from_millis(150));
         assert!(events.lock().unwrap().is_empty());
         q.shutdown();
+    }
+    #[test]
+    fn stop_releases_active_notes_and_cancels_future_notes() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let q = OutputQueue::new(Arc::new(Mutex::new(Box::new(Recording {
+            events: events.clone(),
+        }))));
+        q.send_at(Instant::now(), "on".into(), 60, 100, 1).unwrap();
+        q.send_at(
+            Instant::now() + Duration::from_millis(100),
+            "on".into(),
+            62,
+            100,
+            1,
+        )
+        .unwrap();
+        wait_for(&events, 1);
+        q.stop_and_release();
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[[0x90, 60, 100], [0x80, 60, 0]]
+        );
     }
 }
