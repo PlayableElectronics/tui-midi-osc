@@ -160,7 +160,8 @@ impl Engine {
         let reserve = UdpSocket::bind("127.0.0.1:0")?;
         let sc_addr = reserve.local_addr()?;
         drop(reserve);
-        let path = env::var("INDEX_SCLANG").ok().or_else(|| which("sclang")).ok_or_else(|| anyhow!("sclang not found; install with `brew install --cask supercollider` or set INDEX_SCLANG=/absolute/path/to/sclang"))?;
+        let path = find_sclang().ok_or_else(|| anyhow!("sclang not found; install with `brew install --cask supercollider`, set INDEX_SCLANG=/absolute/path/to/sclang, or install /Applications/SuperCollider.app"))?;
+        eprintln!("INDEX launch sclang={} rust_port={} sc_port={}", path, rust_addr.port(), sc_addr.port());
         let script = fs::canonicalize("sc/bootstrap.scd").context("sc/bootstrap.scd missing")?;
         let mut child = Command::new(path)
             .arg("-D")
@@ -251,6 +252,21 @@ fn which(name: &str) -> Option<String> {
                 .find(|p| p.is_file())
         })
         .map(|p| p.to_string_lossy().into_owned())
+}
+fn find_sclang() -> Option<String> {
+    env::var("INDEX_SCLANG")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .or_else(|| which("sclang"))
+        .or_else(|| {
+            [
+                "/Applications/SuperCollider.app/Contents/MacOS/sclang",
+                "/Applications/SuperCollider/SuperCollider.app/Contents/MacOS/sclang",
+            ]
+            .iter()
+            .find(|p| std::path::Path::new(p).is_file())
+            .map(|p| (*p).into())
+        })
 }
 
 fn pattern_args(req: &str, rev: u64, p: &Pattern) -> Vec<OscType> {
@@ -755,6 +771,9 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
         save(&p)?;
         p
     };
+    if headless {
+        eprintln!("INDEX phase: launching sclang");
+    }
     let state = Arc::new(Mutex::new(AppState::new(p)));
     let (mut e, rx, logs) = Engine::start()?;
     let out: SharedOutput = Arc::new(Mutex::new(Box::new(MonitorOutput::default())));
@@ -792,8 +811,12 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
         }
     });
     let a = state.clone();
+    let print_logs = headless;
     thread::spawn(move || {
         for l in logs {
+            if print_logs {
+                eprintln!("{l}");
+            }
             a.lock().unwrap().log(l)
         }
     });
@@ -802,7 +825,10 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
     } else {
         Some(TerminalGuard::new()?)
     };
-    let deadline = Instant::now() + Duration::from_secs(120);
+    if headless {
+        eprintln!("INDEX phase: waiting for handshake");
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut last_hello = Instant::now() - Duration::from_secs(1);
     let mut last_sync = Instant::now() - Duration::from_secs(1);
     loop {
@@ -831,6 +857,9 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
             if s.status == EngineStatus::Syncing
                 && last_sync.elapsed() >= Duration::from_millis(500)
             {
+                if headless && s.pending_requests.is_empty() {
+                    eprintln!("INDEX phase: synchronizing project");
+                }
                 send_sync(&e, &mut s)?;
                 last_sync = Instant::now();
             }
@@ -880,6 +909,7 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
         s.project.pattern.velocities = vec![77];
         s.project.pattern.channel = 2;
         s.project.pattern.destination = "Smoke".into();
+        eprintln!("INDEX phase: staging");
         stage(&e, &mut s)?;
         drop(s);
         let ack_deadline = Instant::now() + Duration::from_secs(3);
@@ -897,10 +927,12 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
                 "staged pattern leaked into live playback before commit"
             ));
         }
+        eprintln!("INDEX phase: committing scheduled pattern");
         commit(&e, &mut state.lock().unwrap(), "bar")?;
         let stale_req = "smoke-stale";
         let stale_before = state.lock().unwrap().errors.len();
         let stale_revision = state.lock().unwrap().staged_revision.saturating_sub(1);
+        eprintln!("INDEX phase: evaluating recoverable error");
         e.send(
             "/pattern/commit",
             vec![
@@ -933,6 +965,7 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
             vec![OscType::String("nil.doesNotExist".into())],
         )?;
         thread::sleep(Duration::from_millis(200));
+        eprintln!("INDEX phase: stopping");
         e.send("/transport/stop", vec![])?;
         thread::sleep(Duration::from_millis(300));
         let after_stop = state.lock().unwrap().monitor.clone();
@@ -968,6 +1001,7 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
         }
         save(&state.lock().unwrap().project)?;
         queue.shutdown();
+        eprintln!("INDEX phase: shutdown");
         return Ok(());
     }
     let mut g = terminal.take().expect("interactive terminal");
@@ -1001,7 +1035,7 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
 
 fn doctor() {
     println!("Index doctor");
-    match env::var("INDEX_SCLANG").ok().or_else(|| which("sclang")) {
+    match find_sclang() {
         Some(x) => println!("sclang: {x}"),
         None => {
             println!("sclang: MISSING");

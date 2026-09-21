@@ -2,10 +2,6 @@
 set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
-if ! command -v sclang >/dev/null 2>&1 && [ -z "${INDEX_SCLANG:-}" ]; then
-  echo "sclang is required for the smoke test. Run: cargo run -- doctor" >&2
-  exit 2
-fi
 TMP_PROJECT=$(mktemp -d "${TMPDIR:-/tmp}/index-smoke.XXXXXX")
 trap 'rm -rf "$TMP_PROJECT"' EXIT
 cp -R examples/first-light/. "$TMP_PROJECT/"

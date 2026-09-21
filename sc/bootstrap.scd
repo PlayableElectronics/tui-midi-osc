@@ -5,7 +5,10 @@ var scPort = "INDEX_SC_PORT".getenv.asInteger;
 var rust = NetAddr("127.0.0.1", rustPort);
 var clock = TempoClock(2.0);
 var staged, live, stream, runner, playing = false, active = Set.new, pendingToken = 0, pendingReq = nil;
-var parseInts, parseFloats, parsePattern, emit, stop, activate, play, handle;
+var parseInts, parseFloats, parsePattern, emit, stop, activate, play, handle, handlers;
+
+if(thisProcess.openUDPPort(scPort).not) { Error("could not open UDP port " ++ scPort).throw };
+("INDEX bootstrap ready recvPort=" ++ scPort ++ " rustPort=" ++ rustPort).postln;
 
 staged = (name: "bass", degrees: [0], durations: [1.0], velocities: [100], gate: 0.8, channel: 1, destination: "Monitor", revision: 0);
 live = staged.copy;
@@ -82,5 +85,6 @@ handle = { |msg|
         );
     } { |err| var req = if(msg.size > 1) { msg[1].asString } { "" }; var category = if(path == "/index/v1/code/eval") { "evaluation" } { "validation" }; rust.sendMsg("/index/v1/error", req, category, err.errorString) };
 };
-["/index/v1/hello", "/index/v1/project/sync", "/index/v1/pattern/set", "/index/v1/pattern/commit", "/index/v1/transport/play", "/index/v1/transport/stop", "/index/v1/code/eval"].do({ |path| OSCFunc(handle, path, recvPort: scPort) });
+handlers = ["/index/v1/hello", "/index/v1/project/sync", "/index/v1/pattern/set", "/index/v1/pattern/commit", "/index/v1/transport/play", "/index/v1/transport/stop", "/index/v1/code/eval"].collect({ |path| OSCFunc(handle, path, recvPort: scPort) });
+CmdPeriod.add({ handlers.do(_.free); thisProcess.closeUDPPort(scPort) });
 fork { loop { 1.wait } };
