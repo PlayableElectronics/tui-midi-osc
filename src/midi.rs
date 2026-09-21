@@ -1,8 +1,13 @@
 use anyhow::{anyhow, Result};
 use midir::{MidiOutput, MidiOutputConnection, MidiOutputPort};
 use std::{
+    cmp::Ordering,
+    collections::BinaryHeap,
     collections::VecDeque,
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::Instant,
 };
@@ -71,30 +76,99 @@ impl OutputBackend for MidiOutputBackend {
 pub type SharedOutput = Arc<Mutex<Box<dyn OutputBackend>>>;
 
 pub struct OutputQueue {
-    tx: mpsc::Sender<(Instant, String, i32, u8, u8)>,
+    tx: mpsc::Sender<Command>,
     errors: Arc<Mutex<VecDeque<String>>>,
+    generation: Arc<AtomicU64>,
+}
+#[derive(Debug)]
+struct Event {
+    deadline: Instant,
+    sequence: u64,
+    kind: String,
+    note: i32,
+    velocity: u8,
+    channel: u8,
+    generation: u64,
+}
+impl PartialEq for Event {
+    fn eq(&self, other: &Self) -> bool {
+        self.deadline == other.deadline && self.sequence == other.sequence
+    }
+}
+impl Eq for Event {}
+impl PartialOrd for Event {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Event {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .deadline
+            .cmp(&self.deadline)
+            .then_with(|| other.sequence.cmp(&self.sequence))
+    }
+}
+enum Command {
+    Event(Event),
+    Cancel,
+    Shutdown,
 }
 impl OutputQueue {
     pub fn new(output: SharedOutput) -> Self {
-        let (tx, rx) = mpsc::channel::<(Instant, String, i32, u8, u8)>();
+        let (tx, rx) = mpsc::channel::<Command>();
         let errors = Arc::new(Mutex::new(VecDeque::new()));
         let worker_errors = errors.clone();
         thread::spawn(move || {
-            while let Ok((deadline, kind, note, velocity, channel)) = rx.recv() {
-                let now = Instant::now();
-                if deadline > now {
-                    thread::sleep(deadline.duration_since(now));
-                }
-                if let Err(error) = output.lock().unwrap().send(&kind, note, velocity, channel) {
-                    let mut errors = worker_errors.lock().unwrap();
-                    if errors.len() >= 32 {
-                        errors.pop_front();
+            let mut heap = BinaryHeap::<Event>::new();
+            let mut generation = 0_u64;
+            loop {
+                let command = if let Some(event) = heap.peek() {
+                    let wait = event.deadline.saturating_duration_since(Instant::now());
+                    match rx.recv_timeout(wait) {
+                        Ok(command) => Some(command),
+                        Err(mpsc::RecvTimeoutError::Timeout) => None,
+                        Err(_) => break,
                     }
-                    errors.push_back(error.to_string());
+                } else {
+                    match rx.recv() {
+                        Ok(command) => Some(command),
+                        Err(_) => break,
+                    }
+                };
+                if let Some(command) = command {
+                    match command {
+                        Command::Event(event) => heap.push(event),
+                        Command::Cancel => {
+                            generation += 1;
+                            heap.retain(|e| e.generation >= generation);
+                        }
+                        Command::Shutdown => break,
+                    }
+                } else if let Some(event) = heap.pop() {
+                    if event.generation != generation {
+                        continue;
+                    }
+                    if let Err(error) = output.lock().unwrap().send(
+                        &event.kind,
+                        event.note,
+                        event.velocity,
+                        event.channel,
+                    ) {
+                        let mut errors = worker_errors.lock().unwrap();
+                        if errors.len() >= 32 {
+                            errors.pop_front();
+                        }
+                        errors.push_back(error.to_string());
+                    }
                 }
             }
         });
-        Self { tx, errors }
+        Self {
+            tx,
+            errors,
+            generation: Arc::new(AtomicU64::new(0)),
+        }
     }
     pub fn send_at(
         &self,
@@ -104,13 +178,38 @@ impl OutputQueue {
         velocity: u8,
         channel: u8,
     ) -> Result<()> {
+        let generation = self.generation.load(AtomicOrdering::Relaxed);
         self.tx
-            .send((deadline, kind, note, velocity, channel))
+            .send(Command::Event(Event {
+                deadline,
+                sequence: next_sequence(),
+                kind,
+                note,
+                velocity,
+                channel,
+                generation,
+            }))
             .map_err(|e| anyhow!(e.to_string()))
+    }
+    pub fn cancel(&self) {
+        self.generation.fetch_add(1, AtomicOrdering::Relaxed);
+        let _ = self.tx.send(Command::Cancel);
+    }
+    pub fn shutdown(&self) {
+        let _ = self.tx.send(Command::Shutdown);
     }
     pub fn drain_errors(&self) -> Vec<String> {
         self.errors.lock().unwrap().drain(..).collect()
     }
+}
+impl Drop for OutputQueue {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Command::Shutdown);
+    }
+}
+fn next_sequence() -> u64 {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    SEQUENCE.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
 #[cfg(test)]

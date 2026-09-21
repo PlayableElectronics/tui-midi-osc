@@ -236,6 +236,9 @@ fn send_sync(e: &Engine, s: &mut AppState) -> Result<()> {
     e.send("/project/sync", a)
 }
 fn stage(e: &Engine, s: &mut AppState) -> Result<()> {
+    if s.status != EngineStatus::Ready {
+        return Err(anyhow!("SC is not synchronized yet"));
+    }
     let req = s.next_request();
     s.staged = true;
     s.staged_revision += 1;
@@ -245,6 +248,12 @@ fn stage(e: &Engine, s: &mut AppState) -> Result<()> {
     )
 }
 fn commit(e: &Engine, s: &mut AppState, mode: &str) -> Result<()> {
+    if s.status != EngineStatus::Ready {
+        return Err(anyhow!("SC is not synchronized yet"));
+    }
+    if mode != "now" && mode != "bar" {
+        return Err(anyhow!("commit mode must be now or bar"));
+    }
     let req = s.next_request();
     e.send(
         "/pattern/commit",
@@ -261,6 +270,11 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
     match m.addr.as_str() {
         READY => {
             if s.status == EngineStatus::Starting {
+                if m.args.first() != Some(&OscType::Int(1)) {
+                    s.error("protocol error: unsupported SC protocol version");
+                    s.status = EngineStatus::Error;
+                    return;
+                }
                 if let Some(OscType::Float(sc_time)) = m.args.get(1) {
                     s.sc_offset = s.local_epoch.elapsed().as_secs_f64() - (*sc_time as f64);
                 }
@@ -269,8 +283,12 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
             }
         }
         SYNC_ACK => {
+            if s.status != EngineStatus::Syncing {
+                return;
+            }
             s.status = EngineStatus::Ready;
             s.staged = false;
+            s.staged_revision = 1;
             s.live_revision = m
                 .args
                 .get(1)
@@ -286,6 +304,17 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
         }
         STAGED => {
             s.staged = true;
+            s.staged_revision = m
+                .args
+                .get(1)
+                .and_then(|x| {
+                    if let OscType::Int(v) = x {
+                        Some(*v as u64)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(s.staged_revision);
             s.log("pattern staged")
         }
         COMMITTED => {
@@ -346,19 +375,29 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
             }
         }
         ERROR => {
-            s.status = EngineStatus::Error;
-            s.error(
-                m.args
-                    .first()
-                    .and_then(|x| {
-                        if let OscType::String(v) = x {
-                            Some(v.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(|| "SC protocol error".into()),
-            )
+            let category = m
+                .args
+                .get(1)
+                .and_then(|x| {
+                    if let OscType::String(v) = x {
+                        Some(v.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or("protocol");
+            let message = m
+                .args
+                .get(2)
+                .and_then(|x| {
+                    if let OscType::String(v) = x {
+                        Some(v.clone())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "SC protocol error".into());
+            s.error(format!("SC {category}: {message}"));
         }
         _ => s.error(format!("unknown SC message {}", m.addr)),
     }
@@ -413,7 +452,9 @@ fn edit_key(k: KeyEvent, s: &mut AppState, e: &Engine, out: &SharedOutput) -> Re
             KeyCode::Enter => {
                 if let Some(cmd) = text.strip_prefix(':') {
                     match cmd.trim() {
-                        "play" => e.send("/transport/play", vec![])?,
+                        "play" if s.status == EngineStatus::Ready => {
+                            e.send("/transport/play", vec![])?
+                        }
                         "stop" => e.send("/transport/stop", vec![])?,
                         "commit" => commit(e, s, "now")?,
                         "bar" => commit(e, s, "bar")?,
@@ -423,34 +464,36 @@ fn edit_key(k: KeyEvent, s: &mut AppState, e: &Engine, out: &SharedOutput) -> Re
                     return Ok(false);
                 }
                 let i = s.selected;
-                let r = match s.column {
+                let mut candidate = s.project.pattern.clone();
+                let r: Result<()> = match s.column {
                     0 => text
-                        .parse()
-                        .map(|v| s.project.pattern.degrees[i] = v)
+                        .parse::<i32>()
+                        .map(|v| candidate.degrees[i] = v)
                         .map_err(|_| anyhow!("degree must be an integer")),
                     1 => text
-                        .parse()
-                        .map(|v| s.project.pattern.durations[i] = v)
-                        .map_err(|_| anyhow!("duration must be a number")),
+                        .parse::<f32>()
+                        .map(|v| candidate.durations[i] = v)
+                        .map_err(|_| anyhow!("duration must be a positive number")),
                     2 => text
-                        .parse()
-                        .map(|v| s.project.pattern.velocities[i] = v)
+                        .parse::<u8>()
+                        .map(|v| candidate.velocities[i] = v)
                         .map_err(|_| anyhow!("velocity must be 0..127")),
                     3 => text
-                        .parse()
-                        .map(|v| s.project.pattern.channel = v)
+                        .parse::<u8>()
+                        .map(|v| candidate.channel = v)
                         .map_err(|_| anyhow!("channel must be 1..16")),
                     4 => {
-                        s.project.pattern.destination = text;
+                        candidate.destination = text;
                         Ok(())
                     }
                     _ => Ok(()),
                 };
-                if let Err(x) = r.and_then(|_| validate(&s.project.pattern)) {
+                if let Err(x) = r.and_then(|_| validate(&candidate)) {
                     s.error(x.to_string());
                     s.pending_edit = None;
                     return Ok(false);
                 }
+                s.project.pattern = candidate;
                 stage(e, s)?;
                 s.pending_edit = None
             }
@@ -502,7 +545,7 @@ fn edit_key(k: KeyEvent, s: &mut AppState, e: &Engine, out: &SharedOutput) -> Re
             s.screen = (s.screen + 1) % 4;
             Ok(false)
         }
-        KeyCode::Enter if s.screen == 1 => {
+        KeyCode::Enter if s.screen == 1 && s.status == EngineStatus::Ready => {
             s.pending_edit = Some(match s.column {
                 0 => s.project.pattern.degrees[s.selected].to_string(),
                 1 => s.project.pattern.durations[s.selected].to_string(),
@@ -542,6 +585,10 @@ fn edit_key(k: KeyEvent, s: &mut AppState, e: &Engine, out: &SharedOutput) -> Re
             Ok(false)
         }
         KeyCode::Char(' ') => {
+            if s.status != EngineStatus::Ready {
+                s.error("SC is not synchronized yet");
+                return Ok(false);
+            }
             e.send(
                 if s.playing {
                     "/transport/stop"
@@ -581,45 +628,78 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
             a.lock().unwrap().log(l)
         }
     });
-    e.send(
-        "/hello",
-        vec![OscType::String("rust".into()), OscType::Int(1)],
-    )?;
-    let deadline = Instant::now() + Duration::from_secs(if headless { 20 } else { 1 });
-    let mut sync_sent = false;
+    let mut terminal = if headless {
+        None
+    } else {
+        Some(TerminalGuard::new()?)
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_hello = Instant::now() - Duration::from_secs(1);
+    let mut last_sync = Instant::now() - Duration::from_secs(1);
     loop {
         if let Some(code) = e.exited()? {
-            state.lock().unwrap().status = EngineStatus::Error;
-            state
-                .lock()
-                .unwrap()
-                .error(format!("sclang exited ({code})"));
+            let mut s = state.lock().unwrap();
+            s.status = EngineStatus::Error;
+            s.error(format!(
+                "sclang exited ({code}); recent SC output is on the Log screen"
+            ));
             if headless {
                 return Err(anyhow!("sclang exited before sync"));
             }
         }
         {
             let mut s = state.lock().unwrap();
-            if s.status != EngineStatus::Starting && !sync_sent {
+            if s.status == EngineStatus::Starting
+                && last_hello.elapsed() >= Duration::from_millis(250)
+            {
+                e.send(
+                    "/hello",
+                    vec![OscType::String("rust".into()), OscType::Int(1)],
+                )?;
+                last_hello = Instant::now();
+            }
+            if s.status == EngineStatus::Syncing
+                && last_sync.elapsed() >= Duration::from_millis(500)
+            {
                 send_sync(&e, &mut s)?;
-                sync_sent = true;
+                last_sync = Instant::now();
             }
         }
-        if headless {
-            if state.lock().unwrap().status == EngineStatus::Ready {
-                break;
-            }
-            if Instant::now() > deadline {
-                let s = state.lock().unwrap();
-                eprintln!("startup logs: {:?}; errors: {:?}", s.logs, s.errors);
+        if state.lock().unwrap().status == EngineStatus::Ready && headless {
+            break;
+        }
+        if Instant::now() > deadline {
+            let mut s = state.lock().unwrap();
+            s.status = EngineStatus::Error;
+            let logs = format!("{:?}", s.logs);
+            s.error(format!("startup timeout; logs: {logs}"));
+            if headless {
+                eprintln!("startup logs: {logs}; errors: {:?}", s.errors);
                 return Err(anyhow!("startup synchronization timed out"));
             }
-            e.send(
-                "/hello",
-                vec![OscType::String("rust".into()), OscType::Int(1)],
-            )?;
-            thread::sleep(Duration::from_millis(100))
+        }
+        if let Some(g) = terminal.as_mut() {
+            let s = state.lock().unwrap();
+            draw(&mut g.terminal, &s)?;
+            if event::poll(Duration::from_millis(50))?
+                && matches!(
+                    event::read()?,
+                    Event::Key(KeyEvent {
+                        code: KeyCode::Char('q'),
+                        ..
+                    })
+                )
+            {
+                e.stop();
+                return Ok(());
+            }
         } else {
+            thread::sleep(Duration::from_millis(50));
+        }
+        if state.lock().unwrap().status == EngineStatus::Error && headless {
+            return Err(anyhow!("sclang startup failed"));
+        }
+        if !headless && state.lock().unwrap().status == EngineStatus::Ready {
             break;
         }
     }
@@ -641,13 +721,24 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
             ));
         }
         commit(&e, &mut state.lock().unwrap(), "bar")?;
-        thread::sleep(Duration::from_secs(2));
+        let commit_deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < commit_deadline
+            && !state
+                .lock()
+                .unwrap()
+                .monitor
+                .iter()
+                .any(|x| x.destination == "Smoke")
+        {
+            thread::sleep(Duration::from_millis(100));
+        }
         e.send(
             "/code/eval",
             vec![OscType::String("nil.doesNotExist".into())],
         )?;
         thread::sleep(Duration::from_millis(200));
         e.send("/transport/stop", vec![])?;
+        thread::sleep(Duration::from_millis(300));
         let after_stop = state.lock().unwrap().monitor.clone();
         if !before_commit
             .iter()
@@ -667,16 +758,31 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
         if state.lock().unwrap().errors.is_empty() {
             return Err(anyhow!("SC evaluation error was not reported"));
         }
-        let count = after_stop.len();
+        let count = after_stop.iter().filter(|x| x.kind == "on").count();
         thread::sleep(Duration::from_millis(800));
-        if state.lock().unwrap().monitor.len() > count + 1 {
+        let later_count = state
+            .lock()
+            .unwrap()
+            .monitor
+            .iter()
+            .filter(|x| x.kind == "on")
+            .count();
+        if later_count > count {
             return Err(anyhow!("events continued after Stop"));
         }
         save(&state.lock().unwrap().project)?;
+        queue.shutdown();
         return Ok(());
     }
-    let mut g = TerminalGuard::new()?;
+    let mut g = terminal.take().expect("interactive terminal");
     loop {
+        if let Some(code) = e.exited()? {
+            queue.cancel();
+            let mut s = state.lock().unwrap();
+            s.status = EngineStatus::Error;
+            s.playing = false;
+            s.error(format!("sclang exited unexpectedly ({code})"));
+        }
         {
             let mut s = state.lock().unwrap();
             for error in queue.drain_errors() {
@@ -693,6 +799,7 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
         }
     }
     e.stop();
+    queue.shutdown();
     Ok(())
 }
 
