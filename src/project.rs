@@ -78,9 +78,11 @@ pub fn example_project(dir: impl Into<PathBuf>) -> Project {
         },
         pattern: Pattern {
             name: "bass".into(),
-            degrees: vec![0, 0, 3, 5, 3, 0, -2, -5],
-            durations: vec![0.5; 8],
-            velocities: vec![105, 90, 110, 100, 90, 105, 95, 85],
+            degrees: vec![0, 0, 3, 5, 3, 0, -2, -5, 0, 7, 5, 3, 0, -2, -5, -7],
+            durations: vec![0.25; 16],
+            velocities: vec![
+                105, 90, 110, 100, 90, 105, 95, 85, 100, 92, 108, 98, 88, 102, 94, 82,
+            ],
             gate: 0.8,
             channel: 1,
             destination: "Monitor".into(),

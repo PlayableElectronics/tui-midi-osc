@@ -4,7 +4,7 @@ var rustPort = "INDEX_RUST_PORT".getenv.asInteger;
 var scPort = "INDEX_SC_PORT".getenv.asInteger;
 var rust = NetAddr("127.0.0.1", rustPort);
 var clock = TempoClock(2.0);
-var staged, live, stream, runner, playing = false, active = Set.new, pendingToken = 0, pendingReq = nil;
+var staged, live, stream, runner, playing = false, active = Set.new, pendingToken = 0, pendingReq = nil, step = 0, midiOut = nil;
 var parseInts, parseFloats, parsePattern, emit, stop, activate, play, handle, handlers;
 
 if(thisProcess.openUDPPort(scPort).not) { Error("could not open UDP port " ++ scPort).throw };
@@ -24,6 +24,7 @@ parsePattern = { |msg, offset, revision|
 };
 emit = { |kind, note, velocity, channel, destination|
     if(kind == "on") { active.add([note, channel, destination]) } { active.remove([note, channel, destination]) };
+    if(midiOut.notNil) { if(kind == "on") { midiOut.noteOn(channel - 1, note, velocity) } { midiOut.noteOff(channel - 1, note, 0) } };
     rust.sendMsg("/index/v1/event/midi", Main.elapsedTime, kind, note, velocity, channel, destination);
 };
 stop = {
@@ -55,15 +56,18 @@ activate = { |mode, req, revision|
 play = {
     if(playing.not) {
         playing = true;
+        step = 0;
         // Pbind is the source of coherent Events. It is never played through
         // Event.play, so no default synth or scsynth is involved.
         stream = Pbind(\degree, Pseq(live.degrees, inf), \dur, Pseq(live.durations, inf), \velocity, Pseq(live.velocities, inf), \gate, live.gate, \channel, live.channel, \destination, live.destination).asStream;
         runner = Routine({ var ev, note, beatDur;
             while { playing } {
                 ev = stream.next(()); beatDur = ev.dur; note = (60 + ev.degree).clip(0, 127);
+                rust.sendMsg("/index/v1/playhead", step, clock.beats, (clock.beats / 4).floor + 1);
                 emit.("on", note, ev.velocity, ev.channel, ev.destination);
                 { (beatDur * ev.gate).wait; emit.("off", note, 0, ev.channel, ev.destination) }.fork(clock);
                 beatDur.wait;
+                step = (step + 1) % live.degrees.size;
             }
         }).play(clock);
         rust.sendMsg("/index/v1/state", 1);
@@ -75,16 +79,17 @@ handle = { |msg|
     try {
         switch(path,
             "/index/v1/hello", { rust.sendMsg("/index/v1/ready", 1, Main.elapsedTime) },
-            "/index/v1/project/sync", { var req = msg[1].asString; var tempo = msg[2].asFloat; staged = parsePattern.(msg, 3, 1); live = staged.copy; clock.tempo = tempo / 60; rust.sendMsg("/index/v1/project/sync_ack", req, 1, live.name) },
+            "/index/v1/project/sync", { var req = msg[1].asString; var tempo = msg[2].asFloat; staged = parsePattern.(msg, 3, 1); live = staged.copy; clock.tempo = tempo / 60; rust.sendMsg("/index/v1/project/sync_ack", req, 1, live.name); MIDIClient.init; MIDIClient.destinations.do({ |d| rust.sendMsg("/index/v1/midi/destination", d.device.asString, d.name.asString) }) },
             "/index/v1/pattern/set", { var req = msg[1].asString; var rev = msg[2].asInteger; if(rev <= staged.revision) { Error("stale staged revision").throw }; staged = parsePattern.(msg, 3, rev); rust.sendMsg("/index/v1/pattern/staged", req, rev) },
             "/index/v1/pattern/commit", { var req = msg[1].asString; var rev = msg[2].asInteger; var mode = msg[3].asString; if(mode != "now" and: { mode != "bar" }) { Error("invalid commit mode").throw }; if(rev != staged.revision) { Error("commit revision does not match staged revision").throw }; activate.(mode, req, rev) },
             "/index/v1/transport/play", { play.() },
             "/index/v1/transport/stop", { stop.() },
             "/index/v1/code/eval", { msg[1].asString.interpret },
+            "/index/v1/midi/select", { var wanted = msg[1].asString; MIDIClient.init; MIDIClient.destinations.do({ |d| if((d.device.asString ++ " / " ++ d.name.asString) == wanted) { midiOut = MIDIOut.newByName(d.device.asString, d.name.asString); rust.sendMsg("/index/v1/midi/selected", wanted, 1) } }) },
             { Error("unknown OSC path: " ++ path).throw }
         );
     } { |err| var req = if(msg.size > 1) { msg[1].asString } { "" }; var category = if(path == "/index/v1/code/eval") { "evaluation" } { "validation" }; rust.sendMsg("/index/v1/error", req, category, err.errorString) };
 };
-handlers = ["/index/v1/hello", "/index/v1/project/sync", "/index/v1/pattern/set", "/index/v1/pattern/commit", "/index/v1/transport/play", "/index/v1/transport/stop", "/index/v1/code/eval"].collect({ |path| OSCFunc(handle, path, recvPort: scPort) });
+handlers = ["/index/v1/hello", "/index/v1/project/sync", "/index/v1/pattern/set", "/index/v1/pattern/commit", "/index/v1/transport/play", "/index/v1/transport/stop", "/index/v1/code/eval", "/index/v1/midi/select"].collect({ |path| OSCFunc(handle, path, recvPort: scPort) });
 CmdPeriod.add({ handlers.do(_.free); thisProcess.closeUDPPort(scPort) });
 fork { loop { 1.wait } };

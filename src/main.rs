@@ -79,6 +79,10 @@ struct AppState {
     request: u64,
     local_epoch: Instant,
     sc_offset: f64,
+    current_step: usize,
+    current_beat: f64,
+    current_bar: i32,
+    sc_destinations: Vec<String>,
     pending_requests: HashMap<String, RequestRecord>,
 }
 impl AppState {
@@ -101,6 +105,10 @@ impl AppState {
             request: 1,
             local_epoch: Instant::now(),
             sc_offset: 0.0,
+            current_step: 0,
+            current_beat: 0.0,
+            current_bar: 1,
+            sc_destinations: Vec::new(),
             pending_requests: HashMap::new(),
         }
     }
@@ -161,7 +169,12 @@ impl Engine {
         let sc_addr = reserve.local_addr()?;
         drop(reserve);
         let path = find_sclang().ok_or_else(|| anyhow!("sclang not found; install with `brew install --cask supercollider`, set INDEX_SCLANG=/absolute/path/to/sclang, or install /Applications/SuperCollider.app"))?;
-        eprintln!("INDEX launch sclang={} rust_port={} sc_port={}", path, rust_addr.port(), sc_addr.port());
+        eprintln!(
+            "INDEX launch sclang={} rust_port={} sc_port={}",
+            path,
+            rust_addr.port(),
+            sc_addr.port()
+        );
         let script = fs::canonicalize("sc/bootstrap.scd").context("sc/bootstrap.scd missing")?;
         let mut child = Command::new(path)
             .arg("-D")
@@ -474,6 +487,35 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
                 }
             }
         }
+        PLAYHEAD => {
+            if m.args.len() != 3 {
+                s.error("malformed playhead telemetry");
+                return;
+            }
+            let (Some(OscType::Int(step)), Some(OscType::Float(beat)), Some(OscType::Int(bar))) =
+                (m.args.first(), m.args.get(1), m.args.get(2))
+            else {
+                s.error("malformed playhead types");
+                return;
+            };
+            s.current_step = (*step).max(0) as usize;
+            s.current_beat = *beat as f64;
+            s.current_bar = *bar;
+        }
+        MIDI_DESTINATION => {
+            if m.args.len() != 2 {
+                s.error("malformed SC MIDI destination");
+                return;
+            }
+            if let (Ok(device), Ok(name)) = (one_string(&m.args, 0), one_string(&m.args, 1)) {
+                let label = format!("{device} / {name}");
+                if !s.sc_destinations.contains(&label) {
+                    s.sc_destinations.push(label);
+                }
+            } else {
+                s.error("malformed SC MIDI destination types");
+            }
+        }
         EVENT => {
             if m.args.len() != 6 {
                 s.error("malformed MIDI event");
@@ -588,12 +630,12 @@ fn draw(g: &mut Terminal<CrosstermBackend<io::Stdout>>, s: &AppState) -> Result<
             let rows = s.project.pattern.degrees.iter().enumerate().map(|(n, d)| { let v = [n.to_string(), d.to_string(), format!("{:.2}", s.project.pattern.durations[n]), s.project.pattern.velocities[n].to_string(), s.project.pattern.channel.to_string(), s.project.pattern.destination.clone()]; Row::new(v.into_iter().enumerate().map(|(c, x)| Cell::from(x).style(if n == s.selected && c == s.column + 1 { Style::default().bg(Color::Yellow).fg(Color::Black) } else if n == s.selected { Style::default().bg(Color::DarkGray) } else { Style::default() }))) });
             f.render_widget(Table::new(rows, [Constraint::Length(3), Constraint::Length(5), Constraint::Length(7), Constraint::Length(5), Constraint::Length(4), Constraint::Min(10)]).header(Row::new(["#", "DEG", "DUR", "VEL", "CH", "DEST"]).style(Style::default().fg(Color::Yellow))).block(Block::default().title(format!(" bass / {} ", if s.staged { "STAGED" } else { "LIVE" })).borders(Borders::ALL)), z[1]);
         } else {
-            let text = if s.screen == 0 { format!("Transport {}\n\n{}", if s.playing { "PLAYING" } else { "STOPPED" }, s.monitor.iter().rev().take(8).map(|e| format!("{:.2} {} n{} v{} ch{} {}", e.at, e.kind, e.note, e.velocity, e.channel, e.destination)).collect::<Vec<_>>().join("  ")) } else if s.screen == 2 { let mut names = vec!["Monitor (built-in)".to_string()]; names.extend(MidiOutputBackend::ports().map(|p| p.into_iter().map(|x| x.0).collect::<Vec<_>>()).unwrap_or_default()); format!("MIDI destinations (j/k, Enter selects)\n\n{}", names.into_iter().enumerate().map(|(i, n)| format!("{} {}", if i == s.device_index { ">" } else { " " }, n)).collect::<Vec<_>>().join("\n")) } else { format!("Engine log\n\n{}\n{}", s.logs.iter().cloned().collect::<Vec<_>>().join("\n"), s.errors.iter().cloned().collect::<Vec<_>>().join("\n")) };
+            let text = if s.screen == 0 { format!("Transport {}\nBeat {:.2}  Bar {}  Step {}/{}\n\n{}", if s.playing { "PLAYING" } else { "STOPPED" }, s.current_beat, s.current_bar, s.current_step + 1, s.project.pattern.degrees.len(), s.monitor.iter().rev().take(8).map(|e| format!("{:.2} {} n{} v{} ch{} {}", e.at, e.kind, e.note, e.velocity, e.channel, e.destination)).collect::<Vec<_>>().join("\n")) } else if s.screen == 2 { let mut names = vec!["Monitor (built-in)".to_string()]; names.extend(s.sc_destinations.clone()); names.extend(MidiOutputBackend::ports().map(|p| p.into_iter().map(|x| x.0).collect::<Vec<_>>()).unwrap_or_default()); format!("SC MIDI destinations (j/k, Enter selects)\n\n{}", names.into_iter().enumerate().map(|(i, n)| format!("{} {}", if i == s.device_index { ">" } else { " " }, n)).collect::<Vec<_>>().join("\n")) } else { format!("Engine log\n\n{}\n{}", s.logs.iter().cloned().collect::<Vec<_>>().join("\n"), s.errors.iter().cloned().collect::<Vec<_>>().join("\n")) };
             f.render_widget(Paragraph::new(text).block(Block::default().borders(Borders::ALL)), z[1]);
         }
         let status = match s.status { EngineStatus::Starting => "SC STARTING", EngineStatus::Syncing => "SC SYNCING", EngineStatus::Ready => "SC READY", EngineStatus::Error => "SC ERROR" };
         let midi = if s.project.meta.device.backend == "midi" { format!("MIDI: {}", s.project.meta.device.system_port.as_deref().unwrap_or("MIDI MISSING")) } else { "MIDI: Monitor".into() };
-        f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("ENGINE ● {}  {}  {:.2} BPM  {}", status, midi, s.project.meta.tempo, if s.playing { "PLAYING" } else { "STOPPED" }), Style::default().fg(if s.status == EngineStatus::Error { Color::Red } else { Color::Green })), Span::raw(if s.pending_edit.is_some() { " EDIT Enter=apply Esc=cancel" } else { " h/l cell  Enter edit  i now  b next-bar  Space play  : command  ? help  q quit" })])), z[2]);
+        f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("ENGINE ● {}  {}  {:.2} BPM  BEAT {:.2} BAR {} STEP {}/{}  {}", status, midi, s.project.meta.tempo, s.current_beat, s.current_bar, s.current_step + 1, s.project.pattern.degrees.len(), if s.playing { "PLAYING" } else { "STOPPED" }), Style::default().fg(if s.status == EngineStatus::Error { Color::Red } else { Color::Green })), Span::raw(if s.pending_edit.is_some() { " EDIT Enter=apply Esc=cancel" } else { " h/l cell  Enter edit  i now  b next-bar  Space play  : command  ? help  q quit" })])), z[2]);
     })?;
     Ok(())
 }
@@ -608,8 +650,16 @@ fn edit_key(k: KeyEvent, s: &mut AppState, e: &Engine, out: &SharedOutput) -> Re
                             e.send("/transport/play", vec![])?
                         }
                         "stop" => e.send("/transport/stop", vec![])?,
-                        "commit" => commit(e, s, "now")?,
-                        "bar" => commit(e, s, "bar")?,
+                        "commit" => {
+                            if let Err(error) = commit(e, s, "now") {
+                                s.error(error.to_string());
+                            }
+                        }
+                        "bar" => {
+                            if let Err(error) = commit(e, s, "bar") {
+                                s.error(error.to_string());
+                            }
+                        }
                         _ => s.error("commands: :play :stop :commit :bar"),
                     };
                     s.pending_edit = None;
@@ -646,7 +696,9 @@ fn edit_key(k: KeyEvent, s: &mut AppState, e: &Engine, out: &SharedOutput) -> Re
                     return Ok(false);
                 }
                 s.project.pattern = candidate;
-                stage(e, s)?;
+                if let Err(error) = stage(e, s) {
+                    s.error(error.to_string());
+                }
                 s.pending_edit = None
             }
             KeyCode::Esc => s.pending_edit = None,
@@ -661,7 +713,7 @@ fn edit_key(k: KeyEvent, s: &mut AppState, e: &Engine, out: &SharedOutput) -> Re
     match k.code {
         KeyCode::Char('q') => Ok(true),
         KeyCode::Char('?') => {
-            s.log("h/l select cell; Enter edit; i immediate; b next bar; :play/:stop/:commit/:bar");
+            s.log("h/l select cell; Enter edit; i immediate; b next bar; :play :stop :commit :bar :reload :density 0.5 :reverse :randomize");
             Ok(false)
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -737,11 +789,15 @@ fn edit_key(k: KeyEvent, s: &mut AppState, e: &Engine, out: &SharedOutput) -> Re
             Ok(false)
         }
         KeyCode::Char('i') => {
-            commit(e, s, "now")?;
+            if let Err(error) = commit(e, s, "now") {
+                s.error(error.to_string());
+            }
             Ok(false)
         }
         KeyCode::Char('b') => {
-            commit(e, s, "bar")?;
+            if let Err(error) = commit(e, s, "bar") {
+                s.error(error.to_string());
+            }
             Ok(false)
         }
         KeyCode::Char(' ') => {
@@ -774,7 +830,8 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
     if headless {
         eprintln!("INDEX phase: launching sclang");
     }
-    let state = Arc::new(Mutex::new(AppState::new(p)));
+    let initial_state = AppState::new(p);
+    let state = Arc::new(Mutex::new(initial_state));
     let (mut e, rx, logs) = Engine::start()?;
     let out: SharedOutput = Arc::new(Mutex::new(Box::new(MonitorOutput::default())));
     {
@@ -828,7 +885,7 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
     if headless {
         eprintln!("INDEX phase: waiting for handshake");
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut last_hello = Instant::now() - Duration::from_secs(1);
     let mut last_sync = Instant::now() - Duration::from_secs(1);
     loop {
@@ -924,7 +981,11 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
         let before_commit = state.lock().unwrap().monitor.clone();
         if before_commit.iter().any(|x| x.destination == "Smoke") {
             return Err(anyhow!(
-                "staged pattern leaked into live playback before commit"
+                "staged pattern leaked into live playback before commit: {:?}",
+                before_commit
+                    .iter()
+                    .map(|x| (&x.kind, x.note, &x.destination))
+                    .collect::<Vec<_>>()
             ));
         }
         eprintln!("INDEX phase: committing scheduled pattern");
@@ -1033,6 +1094,65 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_demo(dir: PathBuf) -> Result<()> {
+    let project = if dir.join("project.toml").exists() {
+        load(&dir)?
+    } else {
+        example_project(&dir)
+    };
+    let mut state = AppState::new(project);
+    state.status = EngineStatus::Ready;
+    state.log("Monitor demo: SC unavailable; simulated playhead active");
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0")?);
+    let child = Command::new("true").spawn()?;
+    let engine = Engine {
+        socket: socket.clone(),
+        addr: socket.local_addr()?,
+        child,
+        stopped: false,
+    };
+    let output: SharedOutput = Arc::new(Mutex::new(Box::new(MonitorOutput::default())));
+    let queue = OutputQueue::new(output.clone());
+    let mut terminal = TerminalGuard::new()?;
+    let mut last = Instant::now();
+    loop {
+        if state.playing && last.elapsed() >= Duration::from_millis(250) {
+            state.current_step = (state.current_step + 1) % state.project.pattern.degrees.len();
+            state.current_beat += 0.5;
+            state.current_bar = (state.current_beat as i32 / 4) + 1;
+            let i = state.current_step;
+            state.event(MidiEvent {
+                at: state.current_beat,
+                kind: "on".into(),
+                note: 60 + state.project.pattern.degrees[i],
+                velocity: state.project.pattern.velocities[i],
+                channel: state.project.pattern.channel,
+                destination: "Monitor".into(),
+            });
+            last = Instant::now();
+        }
+        draw(&mut terminal.terminal, &state)?;
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(k) = event::read()? {
+                let is_space = k.code == KeyCode::Char(' ');
+                if edit_key(k, &mut state, &engine, &output)? {
+                    break;
+                }
+                if is_space {
+                    state.playing = !state.playing;
+                    state.log(if state.playing {
+                        "Monitor demo playing"
+                    } else {
+                        "Monitor demo stopped"
+                    });
+                }
+            }
+        }
+    }
+    queue.shutdown();
+    Ok(())
+}
+
 fn doctor() {
     println!("Index doctor");
     match find_sclang() {
@@ -1056,8 +1176,11 @@ fn main() -> Result<()> {
             PathBuf::from(a.next().unwrap_or_else(|| "examples/first-light".into())),
             a.any(|x| x == "--headless"),
         ),
+        Some("demo") => run_demo(PathBuf::from(
+            a.next().unwrap_or_else(|| "examples/first-light".into()),
+        )),
         _ => {
-            println!("Index\n\n  cargo run -- doctor\n  cargo run -- run examples/first-light\n  ./scripts/smoke-test");
+            println!("Index\n\n  cargo run -- doctor\n  cargo run -- run examples/first-light\n  cargo run -- demo examples/first-light\n  ./scripts/smoke-test");
             Ok(())
         }
     }

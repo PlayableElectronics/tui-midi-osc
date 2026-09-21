@@ -11,6 +11,8 @@ On macOS, install Rust and SuperCollider. With Homebrew: `brew install rust` and
 ```sh
 cargo run -- doctor
 cargo run -- run examples/first-light
+# deterministic Monitor-mode demo when sclang is unavailable
+cargo run -- demo examples/first-light
 ./scripts/smoke-test
 cargo test
 ```
@@ -19,7 +21,7 @@ Set `INDEX_SCLANG=/absolute/path/to/sclang` to override discovery. The built-in 
 
 ## Controls
 
-`F1` Perform, `F2` Sequence, `F3` Devices, `F4` Log; `h/l` select a tracker cell, `j/k` select a row, `Tab` changes screens, `Enter` edits degree/duration/velocity/channel/destination, `i` commits immediately, `b` commits on the next bar, `Space` plays/stops, `:` enters `:play`, `:stop`, `:commit`, or `:bar`, `?` shows help, and `q` quits with terminal restoration.
+`F1` Perform, `F2` Sequence, `F3` Devices, `F4` Log; `h/l` select a tracker cell, `j/k` select a row, `Tab` changes screens, `Enter` edits degree/duration/velocity/channel/destination, `i` commits immediately, `b` commits on the next bar, `Space` plays/stops, `:` enters `:play`, `:stop`, `:commit`, or `:bar`, `?` shows help, and `q` quits with terminal restoration. `cargo run -- demo examples/first-light` provides the same visible sequence and simulated playhead through the Monitor backend without launching SC.
 
 ## Project layout and protocol
 
@@ -27,4 +29,4 @@ Projects contain metadata/reference and the selected output device in `project.t
 
 ## Limitations and direction
 
-The managed pattern is authoritative in `patterns/bass.toml`; `project.toml` contains metadata, the pattern reference, and one exact-name output configuration. Startup retries `/hello`, synchronizes the saved project, and only then enables transport/editing. Edits are staged until an immediate or next-bar commit; stale revisions and unmatched acknowledgements are rejected. SC evaluation and validation errors are recoverable and appear in the Log screen, while child-process failure is fatal. The Monitor backend is always available; Devices lists native `midir` ports and exact-name restoration never silently remaps a missing destination. The longer-term direction includes modular sequencing tools inspired by ixiQuarks/ixi lang, reusable agents, arrangements/scenes, device profiles, modulation, and NerdSEQ/Dyaxis/OSC-node integrations. Those are future work, not hidden promises of this prototype.
+The managed pattern is authoritative in `patterns/bass.toml`; `project.toml` contains metadata, the pattern reference, and one exact-name output configuration. In the real path SC owns the musical clock, Pbind stream, quantized replacement and production MIDI; Rust displays SC telemetry and supervises the child. The Monitor/demo path is intentionally simulated for terminal demonstrations and tests. Startup retries `/hello`, synchronizes the saved project, and only then enables transport/editing. SC evaluation and validation errors are recoverable and appear in the Log screen, while child-process failure is fatal.
