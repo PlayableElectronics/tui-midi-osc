@@ -79,6 +79,7 @@ pub struct OutputQueue {
     tx: mpsc::Sender<Command>,
     errors: Arc<Mutex<VecDeque<String>>>,
     generation: Arc<AtomicU64>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 #[derive(Debug)]
 struct Event {
@@ -119,7 +120,7 @@ impl OutputQueue {
         let (tx, rx) = mpsc::channel::<Command>();
         let errors = Arc::new(Mutex::new(VecDeque::new()));
         let worker_errors = errors.clone();
-        thread::spawn(move || {
+        let worker = thread::spawn(move || {
             let mut heap = BinaryHeap::<Event>::new();
             let mut generation = 0_u64;
             loop {
@@ -168,6 +169,7 @@ impl OutputQueue {
             tx,
             errors,
             generation: Arc::new(AtomicU64::new(0)),
+            worker: Mutex::new(Some(worker)),
         }
     }
     pub fn send_at(
@@ -197,6 +199,9 @@ impl OutputQueue {
     }
     pub fn shutdown(&self) {
         let _ = self.tx.send(Command::Shutdown);
+        if let Some(worker) = self.worker.lock().unwrap().take() {
+            let _ = worker.join();
+        }
     }
     pub fn drain_errors(&self) -> Vec<String> {
         self.errors.lock().unwrap().drain(..).collect()
@@ -204,7 +209,7 @@ impl OutputQueue {
 }
 impl Drop for OutputQueue {
     fn drop(&mut self) {
-        let _ = self.tx.send(Command::Shutdown);
+        self.shutdown();
     }
 }
 fn next_sequence() -> u64 {
@@ -216,6 +221,27 @@ fn next_sequence() -> u64 {
 mod tests {
     use super::*;
     use std::time::Duration;
+    #[derive(Clone)]
+    struct Recording {
+        events: Arc<Mutex<Vec<[u8; 3]>>>,
+    }
+    impl OutputBackend for Recording {
+        fn send(&mut self, kind: &str, note: i32, velocity: u8, channel: u8) -> Result<()> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(note_bytes(kind, note, velocity, channel)?);
+            Ok(())
+        }
+    }
+    fn wait_for(events: &Arc<Mutex<Vec<[u8; 3]>>>, n: usize) {
+        for _ in 0..50 {
+            if events.lock().unwrap().len() >= n {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     #[test]
     fn channel_is_zero_based() {
         assert_eq!(note_bytes("on", 60, 100, 1).unwrap(), [0x90, 60, 100]);
@@ -228,11 +254,62 @@ mod tests {
         assert_eq!(m.events[0], [0x91, 60, 100]);
     }
     #[test]
-    fn queue_delivers_after_deadline() {
-        let backend: SharedOutput = Arc::new(Mutex::new(Box::new(MonitorOutput::default())));
+    fn queue_delivers_actual_event() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let backend: SharedOutput = Arc::new(Mutex::new(Box::new(Recording {
+            events: events.clone(),
+        })));
         let q = OutputQueue::new(backend.clone());
-        q.send_at(Instant::now(), "on".into(), 60, 100, 1).unwrap();
-        thread::sleep(Duration::from_millis(10));
-        assert!(backend.lock().unwrap().send("off", 60, 0, 1).is_ok());
+        q.send_at(
+            Instant::now() + Duration::from_millis(10),
+            "on".into(),
+            60,
+            100,
+            1,
+        )
+        .unwrap();
+        wait_for(&events, 1);
+        assert_eq!(events.lock().unwrap().as_slice(), &[[0x90, 60, 100]]);
+    }
+    #[test]
+    fn queue_orders_deadlines_and_stable_ties() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let q = OutputQueue::new(Arc::new(Mutex::new(Box::new(Recording {
+            events: events.clone(),
+        }))));
+        let now = Instant::now() + Duration::from_millis(30);
+        q.send_at(now, "on".into(), 1, 1, 1).unwrap();
+        q.send_at(now - Duration::from_millis(10), "on".into(), 2, 1, 1)
+            .unwrap();
+        q.send_at(now, "on".into(), 3, 1, 1).unwrap();
+        wait_for(&events, 3);
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|x| x[1])
+                .collect::<Vec<_>>(),
+            vec![2, 1, 3]
+        );
+    }
+    #[test]
+    fn queue_cancels_generation_and_joins() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let q = OutputQueue::new(Arc::new(Mutex::new(Box::new(Recording {
+            events: events.clone(),
+        }))));
+        q.send_at(
+            Instant::now() + Duration::from_millis(100),
+            "on".into(),
+            60,
+            100,
+            1,
+        )
+        .unwrap();
+        q.cancel();
+        thread::sleep(Duration::from_millis(150));
+        assert!(events.lock().unwrap().is_empty());
+        q.shutdown();
     }
 }

@@ -24,6 +24,33 @@ pub struct ProjectMeta {
     pub tempo: f32,
     #[serde(default = "default_pattern_ref")]
     pub pattern: String,
+    #[serde(default)]
+    pub device: DeviceConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeviceConfig {
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    #[serde(default = "default_destination")]
+    pub logical_name: String,
+    #[serde(default)]
+    pub system_port: Option<String>,
+}
+fn default_backend() -> String {
+    "monitor".into()
+}
+fn default_destination() -> String {
+    "Monitor".into()
+}
+impl Default for DeviceConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_backend(),
+            logical_name: default_destination(),
+            system_port: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -47,6 +74,7 @@ pub fn example_project(dir: impl Into<PathBuf>) -> Project {
             name: "first-light".into(),
             tempo: 120.0,
             pattern: "patterns/bass.toml".into(),
+            device: DeviceConfig::default(),
         },
         pattern: Pattern {
             name: "bass".into(),

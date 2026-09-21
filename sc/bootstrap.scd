@@ -64,7 +64,7 @@ handle = { |msg|
             "/index/v1/code/eval", { msg[1].asString.interpret },
             { Error("unknown OSC path: " ++ path).throw }
         );
-    } { |err| rust.sendMsg("/index/v1/error", err.errorString) };
+    } { |err| var req = if(msg.size > 1) { msg[1].asString } { "" }; var category = if(path == "/index/v1/code/eval") { "evaluation" } { "validation" }; rust.sendMsg("/index/v1/error", req, category, err.errorString) };
 };
 ["/index/v1/hello", "/index/v1/project/sync", "/index/v1/pattern/set", "/index/v1/pattern/commit", "/index/v1/transport/play", "/index/v1/transport/stop", "/index/v1/code/eval"].do({ |path| OSCFunc(handle, path, recvPort: scPort) });
 fork { loop { 1.wait } };

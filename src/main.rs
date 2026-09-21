@@ -21,7 +21,7 @@ use ratatui::{
 };
 use rosc::{decoder::decode_udp, encoder::encode, OscMessage, OscPacket, OscType};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     env, fs, io,
     net::{SocketAddr, UdpSocket},
     path::PathBuf,
@@ -66,6 +66,7 @@ struct AppState {
     request: u64,
     local_epoch: Instant,
     sc_offset: f64,
+    pending_requests: HashSet<String>,
 }
 impl AppState {
     fn new(project: Project) -> Self {
@@ -87,6 +88,7 @@ impl AppState {
             request: 1,
             local_epoch: Instant::now(),
             sc_offset: 0.0,
+            pending_requests: HashSet::new(),
         }
     }
     fn next_request(&mut self) -> String {
@@ -226,6 +228,7 @@ fn pattern_args(req: &str, rev: u64, p: &Pattern) -> Vec<OscType> {
 }
 fn send_sync(e: &Engine, s: &mut AppState) -> Result<()> {
     let req = s.next_request();
+    s.pending_requests.insert(req.clone());
     s.status = EngineStatus::Syncing;
     let mut a = vec![OscType::String(req), OscType::Float(s.project.meta.tempo)];
     a.extend(
@@ -240,11 +243,12 @@ fn stage(e: &Engine, s: &mut AppState) -> Result<()> {
         return Err(anyhow!("SC is not synchronized yet"));
     }
     let req = s.next_request();
-    s.staged = true;
-    s.staged_revision += 1;
+    s.pending_requests.insert(req.clone());
+    s.staged = false;
+    let revision = s.staged_revision + 1;
     e.send(
         "/pattern/set",
-        pattern_args(&req, s.staged_revision, &s.project.pattern),
+        pattern_args(&req, revision, &s.project.pattern),
     )
 }
 fn commit(e: &Engine, s: &mut AppState, mode: &str) -> Result<()> {
@@ -255,6 +259,7 @@ fn commit(e: &Engine, s: &mut AppState, mode: &str) -> Result<()> {
         return Err(anyhow!("commit mode must be now or bar"));
     }
     let req = s.next_request();
+    s.pending_requests.insert(req.clone());
     e.send(
         "/pattern/commit",
         vec![
@@ -286,6 +291,13 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
             if s.status != EngineStatus::Syncing {
                 return;
             }
+            let Some(OscType::String(req)) = m.args.first() else {
+                s.error("malformed sync acknowledgement");
+                return;
+            };
+            if !s.pending_requests.remove(req) {
+                return;
+            }
             s.status = EngineStatus::Ready;
             s.staged = false;
             s.staged_revision = 1;
@@ -303,6 +315,13 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
             s.log("startup project synchronized and activated")
         }
         STAGED => {
+            let Some(OscType::String(req)) = m.args.first() else {
+                s.error("malformed stage acknowledgement");
+                return;
+            };
+            if !s.pending_requests.remove(req) {
+                return;
+            }
             s.staged = true;
             s.staged_revision = m
                 .args
@@ -318,6 +337,13 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
             s.log("pattern staged")
         }
         COMMITTED => {
+            let Some(OscType::String(req)) = m.args.first() else {
+                s.error("malformed commit acknowledgement");
+                return;
+            };
+            if !s.pending_requests.remove(req) {
+                return;
+            }
             s.staged = false;
             s.live_revision = m
                 .args
@@ -411,11 +437,22 @@ impl TerminalGuard {
     fn new() -> Result<Self> {
         enable_raw_mode()?;
         let mut out = io::stdout();
-        execute!(out, EnterAlternateScreen)?;
-        Ok(Self {
-            terminal: Terminal::new(CrosstermBackend::new(out))?,
-            active: true,
-        })
+        if let Err(error) = execute!(out, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
+        match Terminal::new(CrosstermBackend::new(out)) {
+            Ok(terminal) => Ok(Self {
+                terminal,
+                active: true,
+            }),
+            Err(error) => {
+                let _ = disable_raw_mode();
+                let mut out = io::stdout();
+                let _ = execute!(out, LeaveAlternateScreen);
+                Err(error.into())
+            }
+        }
     }
 }
 impl Drop for TerminalGuard {
@@ -441,7 +478,8 @@ fn draw(g: &mut Terminal<CrosstermBackend<io::Stdout>>, s: &AppState) -> Result<
             f.render_widget(Paragraph::new(text).block(Block::default().borders(Borders::ALL)), z[1]);
         }
         let status = match s.status { EngineStatus::Starting => "SC STARTING", EngineStatus::Syncing => "SC SYNCING", EngineStatus::Ready => "SC READY", EngineStatus::Error => "SC ERROR" };
-        f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("ENGINE ● {}  MIDI: Monitor  {:.2} BPM  {}", status, s.project.meta.tempo, if s.playing { "PLAYING" } else { "STOPPED" }), Style::default().fg(if s.status == EngineStatus::Error { Color::Red } else { Color::Green })), Span::raw(if s.pending_edit.is_some() { " EDIT Enter=apply Esc=cancel" } else { " h/l cell  j/k row  Enter edit  i now  b next-bar  Space play  : command  ? help  q quit" })])), z[2]);
+        let midi = if s.project.meta.device.backend == "midi" { format!("MIDI: {}", s.project.meta.device.system_port.as_deref().unwrap_or("MIDI MISSING")) } else { "MIDI: Monitor".into() };
+        f.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!("ENGINE ● {}  {}  {:.2} BPM  {}", status, midi, s.project.meta.tempo, if s.playing { "PLAYING" } else { "STOPPED" }), Style::default().fg(if s.status == EngineStatus::Error { Color::Red } else { Color::Green })), Span::raw(if s.pending_edit.is_some() { " EDIT Enter=apply Esc=cancel" } else { " h/l cell  Enter edit  i now  b next-bar  Space play  : command  ? help  q quit" })])), z[2]);
     })?;
     Ok(())
 }
@@ -558,12 +596,20 @@ fn edit_key(k: KeyEvent, s: &mut AppState, e: &Engine, out: &SharedOutput) -> Re
         KeyCode::Enter if s.screen == 2 => {
             if s.device_index == 0 {
                 *out.lock().unwrap() = Box::new(MonitorOutput::default());
+                s.project.meta.device.backend = "monitor".into();
+                s.project.meta.device.logical_name = "Monitor".into();
+                s.project.meta.device.system_port = None;
+                save(&s.project)?;
                 s.log("Monitor output selected");
             } else if let Ok(ports) = MidiOutputBackend::ports() {
                 if let Some((name, port)) = ports.into_iter().nth(s.device_index - 1) {
                     match MidiOutputBackend::open(&port, name.clone()) {
                         Ok(m) => {
                             *out.lock().unwrap() = Box::new(m);
+                            s.project.meta.device.backend = "midi".into();
+                            s.project.meta.device.logical_name = name.clone();
+                            s.project.meta.device.system_port = Some(name.clone());
+                            save(&s.project)?;
                             s.log(format!("MIDI output selected: {name}"));
                         }
                         Err(e) => s.error(format!("MIDI open failed: {e}")),
@@ -614,6 +660,31 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
     let state = Arc::new(Mutex::new(AppState::new(p)));
     let (mut e, rx, logs) = Engine::start()?;
     let out: SharedOutput = Arc::new(Mutex::new(Box::new(MonitorOutput::default())));
+    {
+        let mut s = state.lock().unwrap();
+        if s.project.meta.device.backend == "midi" {
+            let wanted = s
+                .project
+                .meta
+                .device
+                .system_port
+                .clone()
+                .unwrap_or_default();
+            match MidiOutputBackend::ports()?
+                .into_iter()
+                .find(|(name, _)| *name == wanted)
+            {
+                Some((name, port)) => match MidiOutputBackend::open(&port, name.clone()) {
+                    Ok(output) => {
+                        *out.lock().unwrap() = Box::new(output);
+                        s.log(format!("MIDI connected: {name}"));
+                    }
+                    Err(error) => s.error(format!("MIDI connection error: {error}")),
+                },
+                None => s.error(format!("saved MIDI port is missing: {wanted}")),
+            }
+        }
+    }
     let a = state.clone();
     let queue = Arc::new(OutputQueue::new(out.clone()));
     let q = queue.clone();
@@ -633,7 +704,7 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
     } else {
         Some(TerminalGuard::new()?)
     };
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut last_hello = Instant::now() - Duration::from_secs(1);
     let mut last_sync = Instant::now() - Duration::from_secs(1);
     loop {
@@ -711,8 +782,15 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
         s.project.pattern.channel = 2;
         s.project.pattern.destination = "Smoke".into();
         stage(&e, &mut s)?;
-        e.send("/transport/play", vec![])?;
         drop(s);
+        let ack_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < ack_deadline && !state.lock().unwrap().staged {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if !state.lock().unwrap().staged {
+            return Err(anyhow!("stage acknowledgement timed out"));
+        }
+        e.send("/transport/play", vec![])?;
         thread::sleep(Duration::from_millis(1200));
         let before_commit = state.lock().unwrap().monitor.clone();
         if before_commit.iter().any(|x| x.destination == "Smoke") {
@@ -721,6 +799,25 @@ fn run(dir: PathBuf, headless: bool) -> Result<()> {
             ));
         }
         commit(&e, &mut state.lock().unwrap(), "bar")?;
+        let stale_req = "smoke-stale";
+        let stale_before = state.lock().unwrap().errors.len();
+        let stale_revision = state.lock().unwrap().staged_revision.saturating_sub(1);
+        e.send(
+            "/pattern/commit",
+            vec![
+                OscType::String(stale_req.into()),
+                OscType::Int(stale_revision as i32),
+                OscType::String("bar".into()),
+            ],
+        )?;
+        let stale_deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < stale_deadline && state.lock().unwrap().errors.len() == stale_before
+        {
+            thread::sleep(Duration::from_millis(25));
+        }
+        if state.lock().unwrap().errors.len() == stale_before {
+            return Err(anyhow!("stale commit was not rejected"));
+        }
         let commit_deadline = Instant::now() + Duration::from_secs(8);
         while Instant::now() < commit_deadline
             && !state
