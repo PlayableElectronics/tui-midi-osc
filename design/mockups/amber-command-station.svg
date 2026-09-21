@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1536" height="864" viewBox="0 0 1536 864">
+<rect width="1536" height="864" fill="#120900"/>
+<style>
+text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:16px;fill:#FFB000}
+.t{font-size:18px;font-weight:700;letter-spacing:1px}.v{fill:#FFE1A0}.d{fill:#8A5700}.s{stroke:#D78A00;fill:#080300;stroke-width:2}.g{stroke:#8A5700;fill:none;stroke-width:1}.live{fill:#63D86B;stroke:#63D86B}.edit{fill:#E84A1A}.trace{stroke:#FFB000;fill:none;stroke-width:3}.vel{stroke:#D78A00;stroke-width:3}
+</style>
+<rect x="16" y="14" width="1504" height="48" class="s"/>
+<text x="32" y="45" class="t">INDEX // FIRST LIGHT</text><text x="355" y="45" class="live t">PLAYING</text>
+<text x="520" y="45">132.0 BPM</text><text x="685" y="45">1/16</text><text x="790" y="45">BAR 017.03</text>
+<text x="1110" y="45" class="live">MIDI ●</text><text x="1240" y="45" class="live">OSC ●</text><text x="1360" y="45" class="v">SC READY</text>
+
+<rect x="16" y="76" width="1038" height="226" class="s"/><rect x="1066" y="76" width="454" height="454" class="s"/>
+<rect x="16" y="314" width="1038" height="326" class="s"/><rect x="1066" y="542" width="454" height="98" class="s"/>
+<rect x="16" y="652" width="1504" height="126" class="s"/><rect x="16" y="790" width="1504" height="58" class="s"/>
+<text x="34" y="72" class="t">┤ PATTERN 01 — 16 STEPS ├</text><text x="1084" y="72" class="t">┤ PARAMETERS ├</text>
+<text x="34" y="310" class="t">┤ SEQUENCE SCOPE ├</text><text x="1084" y="538" class="t">┤ MODULATION ├</text>
+<text x="34" y="648" class="t">┤ CONTEXT / SC SOURCE ├</text>
+
+<!-- step grid -->
+<g>
+<rect x="30" y="94" width="116" height="82" class="g"/><rect x="158" y="94" width="116" height="82" class="g"/>
+<rect x="286" y="94" width="116" height="82" class="g"/><rect x="414" y="94" width="116" height="82" class="g"/>
+<rect x="542" y="94" width="116" height="82" class="g"/><rect x="670" y="94" width="116" height="82" class="g"/>
+<rect x="798" y="94" width="116" height="82" class="g"/><rect x="926" y="94" width="116" height="82" class="g"/>
+<rect x="30" y="190" width="116" height="82" class="g"/><rect x="158" y="190" width="116" height="82" class="g"/>
+<rect x="286" y="190" width="116" height="82" class="g"/><rect x="414" y="190" width="116" height="82" class="g"/>
+<rect x="542" y="190" width="116" height="82" class="g"/><rect x="670" y="190" width="116" height="82" class="g"/>
+<rect x="798" y="190" width="116" height="82" class="g"/><rect x="926" y="190" width="116" height="82" class="g"/>
+<rect x="542" y="94" width="116" height="82" fill="none" stroke="#E84A1A" stroke-width="3"/>
+<rect x="670" y="94" width="116" height="82" fill="#63D86B" opacity=".18" stroke="#63D86B" stroke-width="3"/>
+</g>
+<g class="d">
+<text x="42" y="118">01</text><text x="170" y="118">02</text><text x="298" y="118">03</text><text x="426" y="118">04</text>
+<text x="554" y="118" class="edit">05 EDIT</text><text x="682" y="118" class="live">06 LIVE</text><text x="810" y="118">07</text><text x="938" y="118">08</text>
+<text x="42" y="214">09</text><text x="170" y="214">10</text><text x="298" y="214">11</text><text x="426" y="214">12</text>
+<text x="554" y="214">13</text><text x="682" y="214">14</text><text x="810" y="214">15</text><text x="938" y="214">16</text>
+</g>
+<g class="v">
+<text x="42" y="146">C4  104</text><text x="170" y="146">C4   92</text><text x="298" y="146">D#4 110</text><text x="426" y="146">F4   86</text>
+<text x="554" y="146">D#4 108</text><text x="682" y="146">C4  116</text><text x="810" y="146">A#3  78</text><text x="938" y="146">G3   91</text>
+<text x="42" y="242">C4   96</text><text x="170" y="242">—</text><text x="298" y="242">G4   72</text><text x="426" y="242">D4  100</text>
+<text x="554" y="242">F4   88</text><text x="682" y="242">C4  115</text><text x="810" y="242">D#4  84</text><text x="938" y="242">—</text>
+</g>
+
+<!-- scope -->
+<g class="g"><path d="M32 370H1038M32 430H1038M32 490H1038M32 550H1038M160 334V622M288 334V622M416 334V622M544 334V622M672 334V622M800 334V622M928 334V622"/></g>
+<path class="trace" d="M32 527 L70 455 L108 480 L146 402 L184 446 L222 386 L260 420 L298 360 L336 408 L374 472 L412 430 L450 382 L488 448 L526 412 L564 370 L602 444 L640 486 L678 414 L716 350 L754 392 L792 460 L830 422 L868 374 L906 438 L944 486 L982 410 L1038 456"/>
+<g class="vel"><path d="M42 618V568M80 618V548M118 618V580M156 618V530M194 618V558M232 618V518M270 618V550M308 618V500M346 618V540M384 618V574M422 618V548M460 618V512M498 618V564M536 618V536M574 618V504M612 618V552M650 618V578M688 618V530M726 618V492M764 618V520M802 618V562M840 618V540M878 618V506M916 618V552M954 618V580M992 618V526"/></g>
+<path d="M706 330V624" class="live" stroke-width="3"/><text x="718" y="352" class="live">PLAYHEAD 06</text>
+
+<!-- params -->
+<g><text x="1086" y="112" class="d">STEP</text><text x="1280" y="112" class="v">05 / 16</text>
+<text x="1086" y="146" class="d">PITCH</text><rect x="1270" y="124" width="132" height="30" fill="#E84A1A"/><text x="1282" y="146" class="v">D#4</text>
+<text x="1086" y="180" class="d">VELOCITY</text><text x="1280" y="180" class="v">108</text>
+<text x="1086" y="214" class="d">DURATION</text><text x="1280" y="214" class="v">0.25 beat</text>
+<text x="1086" y="248" class="d">GATE</text><text x="1280" y="248" class="v">0.80</text>
+<text x="1086" y="282" class="d">PROBABILITY</text><text x="1280" y="282" class="v">100%</text>
+<text x="1086" y="316" class="d">RATCHET</text><text x="1280" y="316" class="v">1×</text>
+<text x="1086" y="350" class="d">CONDITION</text><text x="1280" y="350" class="v">1:1</text>
+<text x="1086" y="384" class="d">OUTPUT</text><text x="1280" y="384" class="v">nerdseq.cv1</text>
+<text x="1086" y="418" class="d">CHANNEL</text><text x="1280" y="418" class="v">MIDI 01</text>
+<text x="1086" y="466" class="d">FOCUS</text><text x="1280" y="466">pitch</text><text x="1086" y="496" class="d">MOD</text><text x="1280" y="496">lfo_1 +7st</text></g>
+
+<!-- modulation -->
+<text x="1086" y="576" class="d">lfo_1</text><text x="1170" y="576">→ pitch</text><text x="1335" y="576" class="v">+07 st</text><rect x="1420" y="562" width="72" height="12" fill="#D78A00"/>
+<text x="1086" y="606" class="d">env_a</text><text x="1170" y="606">→ velocity</text><text x="1335" y="606" class="v">+18</text><rect x="1420" y="592" width="44" height="12" fill="#D78A00"/>
+
+<!-- context -->
+<text x="34" y="686" class="d">STEP 05 / pitch</text><text x="34" y="718" class="v">Pbind(\degree, Pseq([0, 0, 3, 5, 3, 0, -2, -5], inf),</text>
+<text x="34" y="748" class="v">      \dur, 0.25, \amp, Pkey(\velocity) / 127)  </text><text x="790" y="748" class="edit">STAGED</text>
+<text x="1086" y="686" class="d">Ctrl-Enter</text><text x="1210" y="686">evaluate</text><text x="1086" y="718" class="d">Esc</text><text x="1210" y="718">restore last good</text>
+<text x="1086" y="750" class="d">m</text><text x="1210" y="750">route modulation</text>
+
+<!-- footer -->
+<text x="34" y="824" class="v">F1</text><text x="66" y="824">PERFORM</text><text x="170" y="824" class="v">F2</text><text x="202" y="824">SEQUENCE</text>
+<text x="322" y="824" class="v">F3</text><text x="354" y="824">DEVICES</text><text x="464" y="824" class="v">F4</text><text x="496" y="824">CODE</text>
+<text x="575" y="824" class="v">F5</text><text x="607" y="824">ROUTES</text><text x="714" y="824" class="v">F6</text><text x="746" y="824">LOG</text>
+<text x="858" y="824" class="v">t</text><text x="880" y="824">THEME</text><text x="982" y="824" class="v">?</text><text x="1004" y="824">HELP</text><text x="1100" y="824" class="v">q</text><text x="1122" y="824">QUIT</text>
+<text x="1300" y="824" class="live">CLOCK INTERNAL</text>
+</svg>
