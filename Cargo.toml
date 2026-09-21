@@ -3,6 +3,9 @@ name = "index"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = [".", "crates/instrument-ui"]
+
 [dependencies]
 anyhow = "1"
 crossterm = "0.28"
@@ -12,7 +15,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 ratatui = "0.29"
 thiserror = "2"
+instrument-ui = { path = "crates/instrument-ui" }
 
 [dev-dependencies]
 tempfile = "3"
-

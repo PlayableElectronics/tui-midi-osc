@@ -1,15 +1,9 @@
-# Demo core architecture
+# Instrument UI architecture
 
-The active build is deliberately small. `src/main.rs` contains the Ratatui view, keyboard interaction, demo clock and Monitor activity log. `src/project.rs` contains the 16-step data model, validation, note-name conversion, and atomic TOML persistence.
+`crates/instrument-ui` is a reusable Ratatui widget crate. It contains the instrument shell, semantic themes, square panels, responsive 16-step grid, parameter list, plotting scope, meter, sparklines, modulation summary, pop-down editor, and help overlay.
 
-The edit cursor and playback cursor are separate values. Playback advances on a monotonic deadline calculated as:
+Widgets consume plain view-state structures. They do not know about sequencing engines, SuperCollider, MIDI, OSC, mixers, devices, persistence, or process supervision. The root `ui-demo` command adapts local sample state into those structures and animates it with a local monotonic clock.
 
-```text
-step_seconds = 60 / BPM * step_duration_beats
-```
+The active layout is intentionally a professional terminal instrument: Amber CGA is the default palette, Converter Blue is an alternate, edit focus is red-orange, and live/playhead state is green. The grid renders as 16 columns when space permits and 8×2 on narrower terminals. A minimum-size fallback prevents out-of-bounds rendering.
 
-Starting playback resets the playback cursor to step 1 and emits the first non-rest step immediately. Stopping clears the playback cursor and freezes the activity log. Tempo changes affect the next scheduled step. No production MIDI scheduling occurs in this build.
-
-Project metadata lives in `project.toml`; the managed sixteen-step sequence lives in the referenced `patterns/bass.toml`. Saves write same-directory temporary files, sync them, and rename them into place.
-
-The earlier supervised SuperCollider, OSC and native MIDI experiments remain in repository history and inactive source files for reference. They are intentionally not compiled by this demo nucleus. Future integration must preserve this interaction model rather than reintroduce distributed editing state into the UI.
+This milestone does not alter backend integration. The existing backend experiments remain outside the active UI demo path.

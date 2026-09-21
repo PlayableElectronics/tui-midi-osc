@@ -304,6 +304,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "instrument-ui",
  "midir",
  "ratatui",
  "rosc",
@@ -343,6 +344,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "instrument-ui"
+version = "0.1.0"
+dependencies = [
+ "ratatui",
 ]
 
 [[package]]
