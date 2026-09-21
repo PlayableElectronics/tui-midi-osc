@@ -6,137 +6,109 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Pattern {
-    pub name: String,
-    pub degrees: Vec<i32>,
-    pub durations: Vec<f32>,
-    pub velocities: Vec<u8>,
-    #[serde(default = "default_gate")]
-    pub gate: f32,
-    pub channel: u8,
-    pub destination: String,
-}
+pub const STEP_COUNT: usize = 16;
+pub const DURATIONS: [f32; 4] = [0.125, 0.25, 0.5, 1.0];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProjectMeta {
-    pub name: String,
-    pub tempo: f32,
-    #[serde(default = "default_pattern_ref")]
-    pub pattern: String,
-    #[serde(default)]
-    pub device: DeviceConfig,
+pub struct StepFile {
+    pub note: Option<u8>,
+    pub velocity: u8,
+    pub duration: f32,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DeviceConfig {
-    #[serde(default = "default_backend")]
-    pub backend: String,
-    #[serde(default = "default_destination")]
-    pub logical_name: String,
-    #[serde(default)]
-    pub system_port: Option<String>,
+struct PatternFile {
+    steps: Vec<StepFile>,
 }
-fn default_backend() -> String {
-    "monitor".into()
-}
-fn default_destination() -> String {
-    "Monitor".into()
-}
-impl Default for DeviceConfig {
-    fn default() -> Self {
-        Self {
-            backend: default_backend(),
-            logical_name: default_destination(),
-            system_port: None,
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct ProjectFile {
+    name: String,
+    tempo: f32,
+    pattern: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Project {
     pub dir: PathBuf,
-    pub meta: ProjectMeta,
-    pub pattern: Pattern,
+    pub name: String,
+    pub tempo: f32,
+    pub steps: Vec<StepFile>,
+    pub pattern_path: String,
 }
 
-fn default_gate() -> f32 {
-    0.8
+pub fn note_name(note: Option<u8>) -> String {
+    let Some(note) = note else {
+        return "REST".into();
+    };
+    const NAMES: [&str; 12] = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ];
+    format!("{}{}", NAMES[(note % 12) as usize], (note / 12) as i16 - 1)
 }
-fn default_pattern_ref() -> String {
-    "patterns/bass.toml".into()
-}
-
-pub fn example_project(dir: impl Into<PathBuf>) -> Project {
-    Project {
-        dir: dir.into(),
-        meta: ProjectMeta {
-            name: "first-light".into(),
-            tempo: 120.0,
-            pattern: "patterns/bass.toml".into(),
-            device: DeviceConfig::default(),
-        },
-        pattern: Pattern {
-            name: "bass".into(),
-            degrees: vec![0, 0, 3, 5, 3, 0, -2, -5, 0, 7, 5, 3, 0, -2, -5, -7],
-            durations: vec![0.25; 16],
-            velocities: vec![
-                105, 90, 110, 100, 90, 105, 95, 85, 100, 92, 108, 98, 88, 102, 94, 82,
-            ],
-            gate: 0.8,
-            channel: 1,
-            destination: "Monitor".into(),
-        },
+pub fn validate_steps(steps: &[StepFile]) -> Result<()> {
+    if steps.len() != STEP_COUNT {
+        return Err(anyhow!("a demo pattern must contain exactly 16 steps"));
     }
-}
-
-pub fn validate(p: &Pattern) -> Result<()> {
-    if p.name.trim().is_empty()
-        || p.degrees.is_empty()
-        || p.degrees.len() != p.durations.len()
-        || p.degrees.len() != p.velocities.len()
-    {
-        return Err(anyhow!(
-            "pattern requires equally-sized non-empty degrees, durations and velocities"
-        ));
-    }
-    if p.durations.iter().any(|d| !d.is_finite() || *d <= 0.0) {
-        return Err(anyhow!("durations must be finite and positive"));
-    }
-    if !p.gate.is_finite() || !(0.0..=1.0).contains(&p.gate) {
-        return Err(anyhow!("gate must be between 0 and 1"));
-    }
-    if p.velocities.iter().any(|v| *v > 127)
-        || !(1..=16).contains(&p.channel)
-        || p.destination.trim().is_empty()
-    {
-        return Err(anyhow!("MIDI velocity/channel/destination out of range"));
+    for step in steps {
+        if step.velocity > 127 {
+            return Err(anyhow!("velocity must be 0..127"));
+        }
+        if !DURATIONS
+            .iter()
+            .any(|x| (x - step.duration).abs() < f32::EPSILON)
+        {
+            return Err(anyhow!("duration is not a supported musical value"));
+        }
     }
     Ok(())
 }
-
+pub fn validate_tempo(tempo: f32) -> Result<()> {
+    if (30.0..=300.0).contains(&tempo) {
+        Ok(())
+    } else {
+        Err(anyhow!("tempo must be between 30 and 300 BPM"))
+    }
+}
+pub fn example_project(dir: impl Into<PathBuf>) -> Project {
+    let notes = [
+        60, 60, 63, 65, 63, 60, 58, 55, 60, 67, 65, 63, 60, 58, 55, 53,
+    ];
+    let velocities = [
+        110, 88, 104, 96, 90, 108, 92, 82, 105, 94, 112, 98, 86, 100, 90, 78,
+    ];
+    Project {
+        dir: dir.into(),
+        name: "first-light".into(),
+        tempo: 120.0,
+        pattern_path: "patterns/bass.toml".into(),
+        steps: notes
+            .into_iter()
+            .zip(velocities)
+            .map(|(note, velocity)| StepFile {
+                note: Some(note),
+                velocity,
+                duration: 0.25,
+            })
+            .collect(),
+    }
+}
 pub fn load(dir: &Path) -> Result<Project> {
-    let meta: ProjectMeta = toml::from_str(&fs::read_to_string(dir.join("project.toml"))?)
+    let meta: ProjectFile = toml::from_str(&fs::read_to_string(dir.join("project.toml"))?)
         .context("invalid project.toml")?;
+    validate_tempo(meta.tempo)?;
     let pattern_path = dir.join(&meta.pattern);
-    let pattern: Pattern = toml::from_str(&fs::read_to_string(&pattern_path)?)
+    let pattern: PatternFile = toml::from_str(&fs::read_to_string(&pattern_path)?)
         .with_context(|| format!("invalid {}", pattern_path.display()))?;
-    validate(&pattern)?;
+    validate_steps(&pattern.steps)?;
     Ok(Project {
         dir: dir.to_path_buf(),
-        meta,
-        pattern,
+        name: meta.name,
+        tempo: meta.tempo,
+        steps: pattern.steps,
+        pattern_path: meta.pattern,
     })
 }
-
 fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension(format!(
-        "{}tmp",
-        path.extension()
-            .and_then(|x| x.to_str())
-            .map(|x| format!("{x}."))
-            .unwrap_or_default()
-    ));
+    let tmp = path.with_extension("index-tmp");
     let mut file = fs::File::create(&tmp)?;
     file.write_all(data)?;
     file.sync_all()?;
@@ -144,17 +116,25 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     fs::rename(tmp, path)?;
     Ok(())
 }
-
-pub fn save(p: &Project) -> Result<()> {
-    validate(&p.pattern)?;
-    fs::create_dir_all(p.dir.join("patterns"))?;
+pub fn save(project: &Project) -> Result<()> {
+    validate_tempo(project.tempo)?;
+    validate_steps(&project.steps)?;
+    fs::create_dir_all(project.dir.join("patterns"))?;
+    let meta = ProjectFile {
+        name: project.name.clone(),
+        tempo: project.tempo,
+        pattern: project.pattern_path.clone(),
+    };
     atomic_write(
-        &p.dir.join("project.toml"),
-        toml::to_string_pretty(&p.meta)?.as_bytes(),
+        &project.dir.join("project.toml"),
+        toml::to_string_pretty(&meta)?.as_bytes(),
     )?;
     atomic_write(
-        &p.dir.join(&p.meta.pattern),
-        toml::to_string_pretty(&p.pattern)?.as_bytes(),
+        &project.dir.join(&project.pattern_path),
+        toml::to_string_pretty(&PatternFile {
+            steps: project.steps.clone(),
+        })?
+        .as_bytes(),
     )?;
     Ok(())
 }
@@ -163,27 +143,25 @@ pub fn save(p: &Project) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
-    fn separate_authority_roundtrip() {
-        let d = tempfile::tempdir().unwrap();
-        let p = example_project(d.path());
-        save(&p).unwrap();
-        let q = load(d.path()).unwrap();
-        assert_eq!(p, q);
-        assert!(toml::to_string(&q.meta)
-            .unwrap()
-            .contains("patterns/bass.toml"));
+    fn has_sixteen_steps() {
+        assert_eq!(example_project(".").steps.len(), 16);
     }
     #[test]
-    fn invalid_rejected() {
-        let mut p = example_project(".").pattern;
-        p.durations.pop();
-        assert!(validate(&p).is_err());
+    fn note_names_include_rest() {
+        assert_eq!(note_name(Some(60)), "C4");
+        assert_eq!(note_name(Some(63)), "D#4");
+        assert_eq!(note_name(None), "REST");
     }
     #[test]
-    fn atomic_save_leaves_no_tmp() {
-        let d = tempfile::tempdir().unwrap();
-        let p = example_project(d.path());
+    fn bounds_are_checked() {
+        assert!(validate_steps(&example_project(".").steps).is_ok());
+        assert!(validate_tempo(29.0).is_err());
+    }
+    #[test]
+    fn round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = example_project(dir.path());
         save(&p).unwrap();
-        assert!(!d.path().join("project.toml.tmp").exists());
+        assert_eq!(load(dir.path()).unwrap(), p);
     }
 }

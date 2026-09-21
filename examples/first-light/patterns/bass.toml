@@ -1,7 +1,64 @@
-name = "bass"
-degrees = [7]
-durations = [0.25]
-velocities = [77]
-gate = 0.800000011920929
-channel = 2
-destination = "Smoke"
+[[steps]]
+note = 60
+velocity = 110
+duration = 0.25
+[[steps]]
+note = 60
+velocity = 88
+duration = 0.25
+[[steps]]
+note = 63
+velocity = 104
+duration = 0.25
+[[steps]]
+note = 65
+velocity = 96
+duration = 0.25
+[[steps]]
+note = 63
+velocity = 90
+duration = 0.25
+[[steps]]
+note = 60
+velocity = 108
+duration = 0.25
+[[steps]]
+note = 58
+velocity = 92
+duration = 0.25
+[[steps]]
+note = 55
+velocity = 82
+duration = 0.25
+[[steps]]
+note = 60
+velocity = 105
+duration = 0.25
+[[steps]]
+note = 67
+velocity = 94
+duration = 0.25
+[[steps]]
+note = 65
+velocity = 112
+duration = 0.25
+[[steps]]
+note = 63
+velocity = 98
+duration = 0.25
+[[steps]]
+note = 60
+velocity = 86
+duration = 0.25
+[[steps]]
+note = 58
+velocity = 100
+duration = 0.25
+[[steps]]
+note = 55
+velocity = 90
+duration = 0.25
+[[steps]]
+note = 53
+velocity = 78
+duration = 0.25

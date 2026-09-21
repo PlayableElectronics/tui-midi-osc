@@ -1,9 +1,15 @@
-# Index architecture
+# Demo core architecture
 
-The first slice is deliberately two-process and sequencing-only. Rust owns project files, the Ratatui UI, supervision and OSC display/input. A headless `sclang` owns the musical clock, managed Pbind stream, quantized replacement and production MIDI boundary. Rust retains a Monitor path for deterministic telemetry/tests; it is not the authoritative SC production clock. The explicit `demo` command simulates a moving playhead when SC is unavailable. No synth or audio server is started.
+The active build is deliberately small. `src/main.rs` contains the Ratatui view, keyboard interaction, demo clock and Monitor activity log. `src/project.rs` contains the 16-step data model, validation, note-name conversion, and atomic TOML persistence.
 
-The OSC protocol is versioned under `/index/v1`. Exact messages are: `/hello(client, version)` → `/ready(version, sc_monotonic_seconds)`; `/project/sync(request_id, tempo, name, degrees_csv, durations_csv, velocities_csv, gate, channel, destination)` → `/project/sync_ack(request_id, revision, name)`; `/pattern/set(request_id, revision, name, degrees_csv, durations_csv, velocities_csv, gate, channel, destination)` → `/pattern/staged(request_id, revision)`; `/pattern/commit(request_id, revision, mode)` → `/pattern/committed(request_id, revision, mode, beat)`, `/request/cancelled(request_id, reason)`, or `/request/superseded(request_id, replacement_id)`; `/error(request_id, category, message)`. Transport uses `/transport/play`, `/transport/stop`, `/state(playing)`, and MIDI uses `/event/midi(timestamp, kind, note, velocity, channel, destination)`. Rust validates request ID, operation, revision, mode, count, and types before mutating state; terminal outcomes are retained in bounded diagnostics. Errors use `validation`, `protocol`, `evaluation`, `transport`, or `internal`; recoverable errors do not stop playback. Pattern arrays remain validated CSV strings in v1 because the installed SuperCollider OSC API has less predictable nested-array coercion across versions. Event timestamps are monotonic seconds from the SC process start; Rust maps that domain at handshake and uses a deadline-ordered cancellable output scheduler, without claiming sample-accurate native MIDI scheduling.
+The edit cursor and playback cursor are separate values. Playback advances on a monotonic deadline calculated as:
 
-The single persisted output configuration is `project.toml` metadata: `device.backend` is `monitor` or `midi`, `device.logical_name` is the user-facing destination, and `device.system_port` is the exact native port name. A missing saved port remains disconnected and is never remapped by list position. The current slice has one selected output; per-event multi-destination routing is future work.
+```text
+step_seconds = 60 / BPM * step_duration_beats
+```
 
-Future work, not implemented in this slice: reusable sequencing tools/agents; tracker and indexed views over managed SC objects; arrangements and scenes; modulation matrices for event/control messages; device profiles; native SC livecoding UX; and NerdSEQ, Dyaxis, and custom OSC-node integration. Clock sources should later implement `Internal`, `MIDI input`, `NerdSEQ`, and `OSC` behind a common interface.
+Starting playback resets the playback cursor to step 1 and emits the first non-rest step immediately. Stopping clears the playback cursor and freezes the activity log. Tempo changes affect the next scheduled step. No production MIDI scheduling occurs in this build.
+
+Project metadata lives in `project.toml`; the managed sixteen-step sequence lives in the referenced `patterns/bass.toml`. Saves write same-directory temporary files, sync them, and rename them into place.
+
+The earlier supervised SuperCollider, OSC and native MIDI experiments remain in repository history and inactive source files for reference. They are intentionally not compiled by this demo nucleus. Future integration must preserve this interaction model rather than reintroduce distributed editing state into the UI.
