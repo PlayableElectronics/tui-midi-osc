@@ -360,7 +360,10 @@ fn handle_packet(p: OscPacket, s: &mut AppState, queue: &OutputQueue) {
         }
         "/index/v1/state" => {
             if let Some(OscType::Int(v)) = m.args.first() {
-                s.playing = *v != 0
+                s.playing = *v != 0;
+                if *v == 0 {
+                    queue.cancel();
+                }
             }
         }
         EVENT => {

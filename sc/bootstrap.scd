@@ -4,7 +4,7 @@ var rustPort = "INDEX_RUST_PORT".getenv.asInteger;
 var scPort = "INDEX_SC_PORT".getenv.asInteger;
 var rust = NetAddr("127.0.0.1", rustPort);
 var clock = TempoClock(2.0);
-var staged, live, stream, runner, playing = false, active = Set.new;
+var staged, live, stream, runner, playing = false, active = Set.new, pendingToken = 0;
 var parseInts, parseFloats, parsePattern, emit, stop, activate, play, handle;
 
 staged = (name: "bass", degrees: [0], durations: [1.0], velocities: [100], gate: 0.8, channel: 1, destination: "Monitor", revision: 0);
@@ -30,8 +30,19 @@ stop = {
     rust.sendMsg("/index/v1/state", 0);
 };
 activate = { |mode, req, revision|
-    var doIt = { live = staged.copy; live.revision = revision; if(playing) { stop.(); play.() }; rust.sendMsg("/index/v1/pattern/committed", req, revision, mode, clock.beats) };
-    if(mode == "bar") { clock.schedAbs(clock.nextBar, { doIt.(); nil }) } { doIt.() };
+    var snapshot = staged.copy;
+    var token;
+    snapshot.revision = revision;
+    if(mode == "bar") {
+        pendingToken = pendingToken + 1;
+        token = pendingToken;
+        clock.schedAbs(clock.nextBar, { if(token == pendingToken) { live = snapshot.copy; if(playing) { stop.(); play.() }; rust.sendMsg("/index/v1/pattern/committed", req, revision, mode, clock.beats) }; nil })
+    } {
+        pendingToken = pendingToken + 1;
+        live = snapshot.copy;
+        if(playing) { stop.(); play.() };
+        rust.sendMsg("/index/v1/pattern/committed", req, revision, mode, clock.beats)
+    };
 };
 play = {
     if(playing.not) {
